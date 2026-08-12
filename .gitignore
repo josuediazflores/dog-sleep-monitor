@@ -1,0 +1,27 @@
+# --- secrets ---
+.env
+
+# --- local config (contains your camera's LAN address) ---
+config.json
+
+# --- captured imagery: pictures of the inside of a home. never commit. ---
+snapshots/
+archive/
+archive-old-angle/
+preview.jpg
+*.jpg
+*.jpeg
+*.png
+*.mp4
+
+# --- captured data ---
+sleep_log.csv
+events.csv
+calibration.csv
+calibration.*.csv
+watch.out
+
+# --- python ---
+.venv/
+__pycache__/
+*.pyc

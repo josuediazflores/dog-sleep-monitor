@@ -1,0 +1,52 @@
+{
+  "source": "rtsp",
+  "rtsp": {
+    "host": "192.168.1.100",
+    "port": 554,
+    "path": "/stream2",
+    "user_env": "TAPO_USER",
+    "pass_env": "TAPO_PASS",
+    "connect_timeout": 20.0,
+    "stale_after": 10.0
+  },
+  "usb": {
+    "camera_index": 0,
+    "capture_width": 1280,
+    "capture_height": 720,
+    "flush_frames": 5,
+    "warmup_seconds": 2.0
+  },
+  "roi": [
+    0.0625,
+    0.0667,
+    0.7266,
+    0.9264
+  ],
+  "work_size": [
+    64,
+    48
+  ],
+  "blur_kernel": 5,
+  "pixel_threshold": 0.3,
+  "quiet_score": 0.01,
+  "active_score": 0.04,
+  "scene_change_score": 0.6,
+  "sample_seconds": 5.0,
+  "quiet_samples_to_sleep": 12,
+  "active_samples_to_wake": 2,
+  "log_path": "sleep_log.csv",
+  "print_every_sample": true,
+  "frames_per_sample": 5,
+  "frame_spacing": 0.2,
+  "events_path": "events.csv",
+  "snapshot_dir": "snapshots",
+  "snapshot_on_event": true,
+  "snapshot_every_minutes": 15,
+  "snapshot_scale": 0.5,
+  "snapshot_retention_days": 14,
+  "archive_all_samples": false,
+  "archive_dir": "archive",
+  "archive_scale": 0.5,
+  "archive_quality": 80,
+  "archive_max_mb": 3000
+}
