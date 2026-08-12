@@ -25,3 +25,5 @@ watch.out
 .venv/
 __pycache__/
 *.pyc
+report.html
+*.html
