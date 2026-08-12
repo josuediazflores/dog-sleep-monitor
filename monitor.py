@@ -15,6 +15,7 @@ Subcommands:
 
 import argparse
 import csv
+import hmac
 import json
 import math
 import os
@@ -23,7 +24,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Must be set before the first VideoCapture. UDP loses packets over Wi-Fi and
 # produces torn frames that read as motion; TCP does not.
@@ -122,6 +123,13 @@ DEFAULTS = {
     "archive_scale": 0.5,
     "archive_quality": 80,
     "archive_max_mb": 3000,          # hard stop, so it cannot fill the disk
+
+    # read-only JSON API for the iOS app to pull from
+    "api_bind": "127.0.0.1",         # set to the tailnet IP to reach the phone
+    "api_port": 8787,
+    "api_token_env": "MONITOR_API_TOKEN",
+    "api_min_session_minutes": 10,   # shorter stretches are not "a sleep"
+    "api_merge_stirs_minutes": 10,   # awake gaps below this merge into one sleep
 }
 
 
@@ -1206,6 +1214,228 @@ def write_html_report(cfg, rows, sessions, gaps, args):
     return out
 
 
+# --- serve -------------------------------------------------------------------
+
+def iso(when):
+    """UTC ISO-8601 with a Z suffix, which Swift's .iso8601 strategy decodes."""
+    return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def consolidate_sleep(sessions, gaps, merge_s):
+    """Merge asleep runs separated by a brief stir into one sleep span.
+
+    A dog-health log wants "slept 7h04m with 5 stirs", not 6 separate sleep
+    entries. A long awake span closes the sleep. A data gap also closes it and
+    marks it partial, because the end time is then unknown: the monitor was not
+    watching when it actually ended.
+    """
+    spans = sorted(
+        [(s["start"], s["end"], s["state"], s["duration"]) for s in sessions]
+        + [(g["start"], g["end"], "gap", g["duration"]) for g in gaps],
+        key=lambda t: t[0])
+
+    out, cur = [], None
+    for start, end, state, duration in spans:
+        if state == "asleep":
+            if cur is None:
+                cur = {"start": start, "end": end, "stirs": 0, "partial": False}
+            else:
+                cur["end"] = end
+                cur["stirs"] += 1
+        elif state == "gap":
+            if cur is not None:
+                cur["partial"] = True
+                out.append(cur)
+                cur = None
+        elif state == "awake" and cur is not None and duration > merge_s:
+            out.append(cur)
+            cur = None
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
+def sleep_events(cfg, since=None, min_minutes=None, merge_minutes=None):
+    """Completed sleep sessions, shaped so Swift decodes them into PupEvent.
+
+    Extra keys (source, partial, stirs, duration_s) are ignored by a synthesized
+    Codable decoder, so the same payload serves a plain PupEvent client and a
+    richer one.
+
+    The id is derived from the start instant, so pulling the same session twice
+    yields the same id. PupLog's conflict rule for events is set union by id,
+    which makes repeated pulls idempotent with no cursor bookkeeping required.
+    """
+    min_s = 60.0 * (float(cfg["api_min_session_minutes"])
+                    if min_minutes is None else float(min_minutes))
+    merge_s = 60.0 * (float(cfg["api_merge_stirs_minutes"])
+                      if merge_minutes is None else float(merge_minutes))
+
+    rows = read_log(cfg)
+    sessions, gaps = sessionize(rows, float(cfg["sample_seconds"]))
+    events = []
+    for sp in consolidate_sleep(sessions, gaps, merge_s):
+        duration = (sp["end"] - sp["start"]).total_seconds()
+        if duration < min_s:
+            continue
+        if since is not None and sp["end"] <= since:
+            continue
+        events.append({
+            "id": f"c-{int(sp['start'].timestamp() * 1000)}",
+            "kind": "sleep",
+            "ts": iso(sp["start"]),
+            "start": iso(sp["start"]),
+            "end": iso(sp["end"]),
+            "source": "camera",
+            "partial": sp["partial"],
+            "stirs": sp["stirs"],
+            "duration_s": int(duration),
+        })
+    return events
+
+
+def live_state(cfg):
+    """Current state and when it began, for an in-progress sleep banner."""
+    rows = read_log(cfg)
+    if not rows:
+        return {"state": "unknown", "since": None, "elapsed_s": 0,
+                "last_sample": None, "stale": True}
+    sessions, _gaps = sessionize(rows, float(cfg["sample_seconds"]))
+    last = sessions[-1] if sessions else None
+    age = (datetime.now() - rows[-1][0]).total_seconds()
+    return {
+        "state": last["state"] if last else "unknown",
+        "since": iso(last["start"]) if last else None,
+        "elapsed_s": int((datetime.now() - last["start"]).total_seconds())
+                     if last else 0,
+        "last_sample": iso(rows[-1][0]),
+        "last_score": rows[-1][1],
+        # The monitor may have died while this server keeps answering. Say so
+        # rather than letting a client believe a four-hour-old state is current.
+        "stale": age > 4 * float(cfg["sample_seconds"]),
+        "stale_for_s": int(age) if age > 4 * float(cfg["sample_seconds"]) else 0,
+    }
+
+
+def make_handler(cfg, token):
+    from http.server import BaseHTTPRequestHandler
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "dog-sleep-monitor/1"
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, code, payload):
+            body = json.dumps(payload, separators=(",", ":")).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authorized(self):
+            header = self.headers.get("Authorization", "")
+            prefix = "Bearer "
+            if not header.startswith(prefix):
+                return False
+            # Constant-time, so a wrong token cannot be discovered byte by byte
+            # from response timing.
+            return hmac.compare_digest(header[len(prefix):], token)
+
+        def log_message(self, fmt, *a):
+            # Default logs the full request line. Keep it, but never headers.
+            sys.stderr.write(f"{stamp()}  {self.address_string()}  {fmt % a}\n")
+
+        def do_POST(self):
+            self._send(405, {"error": "read-only server"})
+
+        do_PUT = do_DELETE = do_PATCH = do_POST
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+            query = urllib.parse.parse_qs(parsed.query)
+
+            if path == "/health":
+                # Unauthenticated on purpose: proves the process is alive and
+                # nothing more. No dog data, no config, no version of anything
+                # an attacker could pivot on.
+                return self._send(200, {"ok": True})
+
+            if not self._authorized():
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Bearer realm="monitor"')
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
+            if path == "/v1/state":
+                return self._send(200, live_state(cfg))
+
+            if path == "/v1/events":
+                since = None
+                raw = (query.get("since") or [None])[0]
+                if raw:
+                    try:
+                        since = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                        if since.tzinfo:
+                            since = since.astimezone().replace(tzinfo=None)
+                    except ValueError:
+                        return self._send(400, {"error": "since must be ISO-8601"})
+                try:
+                    events = sleep_events(
+                        cfg, since=since,
+                        min_minutes=(query.get("min_minutes") or [None])[0],
+                        merge_minutes=(query.get("merge_minutes") or [None])[0])
+                except ValueError:
+                    return self._send(400, {"error": "bad numeric parameter"})
+                return self._send(200, {
+                    "events": events,
+                    "count": len(events),
+                    "server_time": iso(datetime.now()),
+                    "state": live_state(cfg),
+                })
+
+            return self._send(404, {"error": "not found"})
+
+    return Handler
+
+
+def cmd_serve(cfg, args):
+    from http.server import ThreadingHTTPServer
+
+    token = os.environ.get(cfg["api_token_env"])
+    if not token or len(token) < 24:
+        raise SystemExit(
+            f"Set {cfg['api_token_env']} to a long random value before serving.\n\n"
+            f"  echo \"{cfg['api_token_env']}=$(openssl rand -hex 32)\" >> "
+            f"{ENV_PATH}\n\n"
+            "Refusing to start without one: this endpoint reports when someone's\n"
+            "dog is unattended, which is not something to serve unauthenticated."
+        )
+
+    host = args.bind or cfg["api_bind"]
+    port = int(args.port or cfg["api_port"])
+    httpd = ThreadingHTTPServer((host, port), make_handler(cfg, token))
+    print(f"Serving on http://{host}:{port}")
+    print("  GET /health              no auth, liveness only")
+    print("  GET /v1/state            current state")
+    print("  GET /v1/events?since=    completed sleep sessions as PupEvent JSON")
+    print("Auth: Authorization: Bearer <token>. Read-only; POST/PUT/DELETE "
+          "return 405.")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"\nNote: bound to {host}, so this is reachable beyond this machine.\n"
+              "Plain HTTP means the token crosses the network in the clear. Put it\n"
+              "on a tailnet (or `tailscale serve --https`) rather than a bare LAN.")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        httpd.server_close()
+
+
 # --- purge -------------------------------------------------------------------
 
 PURGE_TARGETS = {
@@ -1394,6 +1624,10 @@ def main():
 
     sub.add_parser("tune", help="grid-search thresholds against labeled data")
 
+    p = sub.add_parser("serve", help="read-only JSON API for the iOS app")
+    p.add_argument("--bind", help="interface to bind (default 127.0.0.1)")
+    p.add_argument("--port", type=int, help="port (default 8787)")
+
     p = sub.add_parser("report", help="summarize the log into sleep sessions")
     p.add_argument("--from", dest="start", help="HH:MM or ISO; default all")
     p.add_argument("--to", dest="end", help="HH:MM or ISO; default all")
@@ -1419,6 +1653,7 @@ def main():
      "tune": cmd_tune,
      "purge": cmd_purge,
      "report": cmd_report,
+     "serve": cmd_serve,
      "doctor": cmd_doctor}[args.cmd](cfg, args)
 
 

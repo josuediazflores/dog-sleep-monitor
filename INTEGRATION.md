@@ -1,0 +1,187 @@
+# Feeding PupLog from the Pi
+
+How sleep sessions detected on a Raspberry Pi reach the PupLog iOS app.
+
+## Why the Pi does not write to CloudKit
+
+The obvious design is for the Pi to write `Event` records straight into the
+CloudKit zone the app already syncs. It does not work.
+
+CloudKit Web Services offers two ways to authenticate. A **server-to-server
+key** is the only one an unattended machine can hold, and it can only reach the
+**public** database. Reaching a private database requires an API token plus a
+web auth token obtained by a person signing in with an Apple ID, which a
+headless Pi cannot do. Apple's developer relations state this directly: a
+server-to-server key authenticates "to make API calls to a public database", and
+private-database access needs an API token.
+
+PupLog keeps everything in `PupLogZone` in the owner's **private** database,
+shared zone-wide via `CKShare`. So the Pi is locked out by design, and putting
+dog data in the public database to work around that would make it readable by
+any authenticated user of the app and would break the sharing model entirely.
+
+## The architecture
+
+The app stays the only CloudKit writer.
+
+```
+  Pi                                  iPhone
+  ┌──────────────────┐                ┌─────────────────────────┐
+  │ watch  ──> CSV   │                │  puller                 │
+  │ serve  ──> JSON  │ ──HTTP GET──>  │    ↓                    │
+  └──────────────────┘   over the     │  PupStore.addEvent      │
+     read-only          tailnet       │    ↓                    │
+                                      │  CloudSync ──> CloudKit │
+                                      └─────────────────────────┘
+                                                        ↓
+                                            other parents' phones
+```
+
+This preserves everything already built: the `CKShare` participant model,
+the documented conflict rules, `CKSyncEngine` retry and offline queues, and the
+fact that no new credential has to exist anywhere in CloudKit.
+
+## Endpoints
+
+Base URL is the Pi's tailnet address, e.g. `http://100.x.y.z:8787`.
+
+| method | path | auth | returns |
+| --- | --- | --- | --- |
+| GET | `/health` | none | `{"ok":true}` and nothing else |
+| GET | `/v1/state` | bearer | current state, for the live sleep banner |
+| GET | `/v1/events?since=&min_minutes=&merge_minutes=` | bearer | completed sleep sessions |
+
+Anything other than GET returns 405. There is no write path at all.
+
+`/health` is deliberately unauthenticated and deliberately empty: it proves the
+process is alive and reveals nothing about a dog, a home, or a version number
+worth pivoting on.
+
+### `/v1/events`
+
+```json
+{
+  "events": [
+    { "id": "c-1786572214000", "kind": "sleep",
+      "ts":    "2026-08-12T22:03:34Z",
+      "start": "2026-08-12T22:03:34Z",
+      "end":   "2026-08-12T22:06:09Z",
+      "source": "camera", "partial": false, "stirs": 1, "duration_s": 155 }
+  ],
+  "count": 1,
+  "server_time": "2026-08-12T22:55:27Z",
+  "state": { "state": "awake", "since": "...", "stale": false }
+}
+```
+
+Each event decodes directly into `PupEvent`. A synthesized `Codable` decoder
+ignores unknown keys, so `source`, `partial`, `stirs`, and `duration_s` cost the
+app nothing while remaining available to a richer client.
+
+```swift
+struct Feed: Decodable { let events: [PupEvent]; let serverTime: Date }
+
+var request = URLRequest(url: base.appending(path: "v1/events"))
+request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+let (data, _) = try await URLSession.shared.data(for: request)
+let decoder = JSONDecoder()
+decoder.dateDecodingStrategy = .iso8601
+decoder.keyDecodingStrategy = .convertFromSnakeCase
+let feed = try decoder.decode(Feed.self, from: data)
+```
+
+Dates are UTC with a `Z` suffix, which `.iso8601` handles without a custom
+formatter.
+
+### Idempotency, which is the important part
+
+`id` is `c-<start-instant-in-ms>`, derived from the data rather than assigned.
+Pulling the same session twice produces the same id both times.
+
+That matters because `PupStore.applyCloudChanges` already merges events with
+`Dictionary(userEvents.map { ($0.id, $0) }, uniquingKeysWith:)`, and
+`SYNC-PLAN.md` records the rule as "events are immutable and append-only; sync =
+set union by id". So a re-pull is a no-op, a partial pull self-heals, and the
+puller needs no cursor bookkeeping or dedupe logic. Use `since` only to keep
+responses small.
+
+The `c-` prefix also distinguishes camera-detected events from `u-` user events
+and `s-` seed data, which gives the UI a way to attribute them and gives
+"reset my entries" a way to leave them alone (or not).
+
+### Two flags worth honoring
+
+- **`partial: true`** means the session touched a stretch where the monitor was
+  not running, so the end time is a lower bound rather than an observation. Show
+  it differently or drop it, but do not present it as measured.
+- **`state.stale: true`** means no fresh sample has arrived. The server keeps
+  answering after `watch` dies, so without checking this the app would happily
+  report "asleep for 6 hours" when really nothing has been watching for 6 hours.
+
+## Semantics decided on the server
+
+Two knobs, in `config.json`, because they are judgments about dogs rather than
+about transport:
+
+| setting | default | effect |
+| --- | --- | --- |
+| `api_min_session_minutes` | 10 | shorter stretches of stillness are not reported as sleep |
+| `api_merge_stirs_minutes` | 10 | an awake span shorter than this merges the sleeps on either side into one, counted in `stirs` |
+
+So a night reads as one 7h04m sleep with 5 stirs, not six separate sleep events.
+A data gap always breaks a merge, since sleep across an unobserved stretch is an
+assumption, not a measurement.
+
+## Security
+
+**Transport: put it on the tailnet, not the LAN.** WireGuard gives encryption
+and device identity for free, works from anywhere without port forwarding, and
+means the endpoint is not exposed to other devices on the home network.
+
+```bash
+# on the Pi
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+tailscale ip -4          # the address the app will use
+```
+
+Install Tailscale on the iPhone from the App Store and sign in with the same
+account. Then bind the server to the tailnet address:
+
+```bash
+MONITOR_API_TOKEN=... python3 monitor.py serve --bind 100.x.y.z
+```
+
+**Auth: a bearer token**, compared with `hmac.compare_digest` so a wrong token
+cannot be recovered byte by byte from response timing. Generate one and keep it
+out of the repo:
+
+```bash
+echo "MONITOR_API_TOKEN=$(openssl rand -hex 32)" >> .env
+```
+
+Store it in the iOS **Keychain**, not `UserDefaults` and not source. The server
+refuses to start without a token of at least 24 characters.
+
+**What this does not protect against**, stated plainly:
+
+- Plain HTTP on a bare LAN sends the token in the clear to anything sniffing that
+  network. On a tailnet WireGuard covers it. For real TLS, `tailscale serve
+  --https` issues a certificate.
+- The token is a single shared secret with no rotation or per-device revocation.
+  Rotating it means editing `.env`, restarting, and updating the phone.
+- Anyone holding the token learns when the dog is unattended. That is the actual
+  sensitivity of this endpoint and the reason it is not served openly.
+
+## Still to build, on the app side
+
+1. A puller: `URLSession` fetch on `scenePhase == .active` and on a timer, into
+   the existing store. The app has no `URLSession` anywhere today, so this is
+   genuinely new code.
+2. Keychain storage for the base URL and token, plus a settings row to enter them.
+3. Attribution in the UI: whether a camera-detected sleep looks different from a
+   hand-logged one, and whether it is editable or deletable.
+4. Whether the live `/v1/state` drives the existing `ActiveSession` banner or
+   only shows up after a session completes.
+
+Items 3 and 4 are product decisions, not technical ones.

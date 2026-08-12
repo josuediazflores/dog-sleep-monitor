@@ -49,5 +49,10 @@
   "archive_scale": 0.5,
   "archive_quality": 80,
   "archive_max_mb": 3000,
-  "scene_corr_max": 0.5
+  "scene_corr_max": 0.5,
+  "api_bind": "127.0.0.1",
+  "api_port": 8787,
+  "api_token_env": "MONITOR_API_TOKEN",
+  "api_min_session_minutes": 10,
+  "api_merge_stirs_minutes": 10
 }

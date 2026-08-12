@@ -281,6 +281,22 @@ score trace beneath it with the thresholds drawn in. The trace uses a sqrt scale
 because scores span three orders of magnitude, from 0.0000 to 0.82, and a linear
 axis either clips the peaks or flattens the sleep periods into one pixel row.
 
+## Feeding an app
+
+```bash
+echo "MONITOR_API_TOKEN=$(openssl rand -hex 32)" >> .env
+.venv/bin/python monitor.py serve --bind 100.x.y.z
+```
+
+A read-only JSON API. `GET /v1/events` returns completed sleep sessions with
+data-derived ids, so repeated pulls are idempotent; `GET /v1/state` returns the
+current state with a `stale` flag so a client cannot mistake a dead monitor for a
+sleeping dog. Bearer-token auth, constant-time compared, and the server refuses
+to start without a token. Anything other than GET returns 405.
+
+See [INTEGRATION.md](INTEGRATION.md) for the full contract, the reasoning behind
+pulling rather than pushing, and the security model.
+
 ## Stored data
 
 Numbers are small and permanent. Images are large and temporary.
