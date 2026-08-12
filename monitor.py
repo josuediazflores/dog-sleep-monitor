@@ -96,7 +96,10 @@ DEFAULTS = {
     "quiet_score": 0.010,            # below this, the frame pair counts as still
     "active_score": 0.030,           # above this, it counts as movement
     "scene_change_score": 0.60,      # a scene change needs BOTH a score above
-    "scene_corr_max": 0.50,          # this AND correlation below this, so a dog
+    "scene_corr_max": 0.50,
+    "presence_threshold": 0.030,     # vs empty-pen references: above = a dog is
+                                     # there. Measured empty 0.0000, sleeping
+                                     # dog 0.12, so this sits in a wide gap.          # this AND correlation below this, so a dog
                                      # filling the frame is not mistaken for the
                                      # day/night IR switch
 
@@ -1536,6 +1539,99 @@ def cmd_serve(cfg, args):
         httpd.server_close()
 
 
+# --- presence ----------------------------------------------------------------
+
+REF_DIR = os.path.join(HERE, "references")
+
+
+def load_references(cfg):
+    """Prepared empty-pen reference images, one per lighting condition."""
+    if not os.path.isdir(REF_DIR):
+        return []
+    out = []
+    for name in sorted(os.listdir(REF_DIR)):
+        if not name.lower().endswith(".jpg"):
+            continue
+        img = cv2.imread(os.path.join(REF_DIR, name))
+        if img is not None:
+            out.append((name, prepare(img, cfg)))
+    return out
+
+
+def presence_score(frame_prepared, references, pixel_threshold):
+    """How unlike *every* known empty pen this frame is, in [0, 1].
+
+    The minimum across references, not the mean. An empty pen only has to match
+    one stored condition to be recognised, which is what makes a growing
+    reference set robust: day, night-with-IR, blanket-moved, all coexist.
+
+    Returns (score, which_reference_matched).
+    """
+    if not references:
+        return None, None
+    best, which = 1.0, None
+    for name, ref in references:
+        d = float((np.abs(ref - frame_prepared) > pixel_threshold).mean())
+        if d < best:
+            best, which = d, name
+    return best, which
+
+
+def cmd_reference(cfg, args):
+    """Capture an empty-pen reference. Run this while the pen is genuinely empty.
+
+    Each capture teaches the presence check one more lighting condition. The
+    day/night IR switch changes every surface at once, so a daytime reference
+    cannot recognise an empty pen at night; that needs its own capture.
+    """
+    os.makedirs(REF_DIR, exist_ok=True)
+    refs = load_references(cfg)
+
+    cam = open_camera(cfg)
+    try:
+        prepared, raw = grab_sample(cam, cfg, keep_raw=True)
+    finally:
+        cam.close()
+
+    score, which = presence_score(prepared, refs, cfg["pixel_threshold"])
+    if score is not None:
+        print(f"  Against {len(refs)} existing reference(s): closest is "
+              f"{which} at {score:.4f}")
+        if score > cfg["presence_threshold"] and not args.force:
+            raise SystemExit(
+                f"\n  This frame looks OCCUPIED ({score:.4f} > "
+                f"{cfg['presence_threshold']}).\n"
+                "  Refusing to store it as an empty-pen reference: a reference\n"
+                "  with a dog in it would teach the check that dogs are normal.\n"
+                "  Use --force if you are certain the pen is empty and the scene\n"
+                "  has simply changed (furniture moved, lights changed).")
+
+    label = args.label or ("night" if (datetime.now().hour >= 20
+                                       or datetime.now().hour < 6) else "day")
+    path = os.path.join(REF_DIR, f"{label}_{datetime.now():%Y%m%dT%H%M%S}.jpg")
+    cv2.imwrite(path, raw, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    print(f"  Stored {os.path.relpath(path, HERE)}")
+    print(f"  {len(load_references(cfg))} reference(s) now known.")
+
+
+def cmd_presence(cfg, args):
+    """Check the current frame against the empty-pen references."""
+    refs = load_references(cfg)
+    if not refs:
+        raise SystemExit("No references yet. Run `reference` while the pen is "
+                         "empty.")
+    cam = open_camera(cfg)
+    try:
+        prepared = grab_sample(cam, cfg)
+    finally:
+        cam.close()
+    score, which = presence_score(prepared, refs, cfg["pixel_threshold"])
+    verdict = "OCCUPIED" if score > cfg["presence_threshold"] else "EMPTY"
+    print(f"  presence score {score:.4f}  (threshold "
+          f"{cfg['presence_threshold']})  -> {verdict}")
+    print(f"  closest reference: {which}  of {len(refs)} known")
+
+
 # --- dataset -----------------------------------------------------------------
 
 ARCHIVE_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})_([0-9.]+)\.jpg$")
@@ -1857,6 +1953,12 @@ def main():
     p.add_argument("kind", choices=["out", "in"])
     p.add_argument("--at", help="HH:MM, HH:MM:SS or ISO; default now")
 
+    p = sub.add_parser("reference", help="capture an empty-pen reference frame")
+    p.add_argument("--label", help="condition name, default day/night by clock")
+    p.add_argument("--force", action="store_true",
+                   help="store even if the frame looks occupied")
+    sub.add_parser("presence", help="is the pen occupied right now?")
+
     sub.add_parser("tune", help="grid-search thresholds against labeled data")
 
     p = sub.add_parser("dataset", help="export archived frames for labeling")
@@ -1895,6 +1997,8 @@ def main():
      "purge": cmd_purge,
      "dataset": cmd_dataset,
      "mark": cmd_mark,
+     "reference": cmd_reference,
+     "presence": cmd_presence,
      "report": cmd_report,
      "serve": cmd_serve,
      "doctor": cmd_doctor}[args.cmd](cfg, args)
