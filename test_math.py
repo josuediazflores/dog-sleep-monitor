@@ -15,7 +15,7 @@ Run: python test_math.py
 import cv2
 import numpy as np
 
-from monitor import DEFAULTS, motion_score, prepare, roi_pixels
+from monitor import DEFAULTS, correlation, motion_score, prepare, roi_pixels
 
 RNG = np.random.default_rng(1234)
 
@@ -99,12 +99,33 @@ def main():
     print(f"\n{'resolution independence (720p vs 360p)':<38}{hi:>9.4f}{lo:>9.4f}   "
           f"{'PASS' if res_ok else 'FAIL'}  gap {abs(hi - lo):.4f} (< 0.02)")
 
+    # Correlation is what separates a global re-lighting from a large local
+    # change. Magnitude cannot: a dog close to the camera measured 0.82 live,
+    # above any plausible magnitude-only scene threshold.
+    cfg = dict(DEFAULTS); cfg["roi"] = PLAYPEN_ROI
+    p_ = lambda f: prepare(f, cfg)
+    ir_corr = correlation(p_(scene(DOG)), p_(scene(DOG, ir=True)))
+    big_dog = scene(DOG)
+    huge = scene((650, 560))
+    huge[300:700, 200:1100] = 210          # dog filling most of the ROI
+    dog_corr = correlation(p_(big_dog), p_(huge))
+    dog_score = motion_score(p_(big_dog), p_(huge), cfg["pixel_threshold"])
+    limit = DEFAULTS["scene_corr_max"]
+    ir_ok = ir_corr < limit
+    dog_ok = dog_corr >= limit
+    passed += ir_ok + dog_ok
+    print(f"\n{'IR switch correlation':<38}{ir_corr:>9.3f}{'':>9}   "
+          f"{'PASS' if ir_ok else 'FAIL'}  scene (< {limit})")
+    print(f"{'frame-filling dog correlation':<38}{dog_corr:>9.3f}{'':>9}   "
+          f"{'PASS' if dog_ok else 'FAIL'}  movement (>= {limit}), "
+          f"despite score {dog_score:.3f}")
+
     box_ok = roi_pixels(PLAYPEN_ROI, 640, 360) == (150, 210, 350, 140)
     passed += box_ok
     print(f"{'roi_pixels maps onto 640x360':<38}{'':>18}   "
           f"{'PASS' if box_ok else 'FAIL'}  {roi_pixels(PLAYPEN_ROI, 640, 360)}")
 
-    total = len(CASES) + 2
+    total = len(CASES) + 4
     print(f"\n{passed}/{total} passed (ROI column is what the monitor uses)")
 
     weak = [n for n, a, b, e in CASES

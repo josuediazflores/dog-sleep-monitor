@@ -48,5 +48,6 @@
   "archive_dir": "archive",
   "archive_scale": 0.5,
   "archive_quality": 80,
-  "archive_max_mb": 3000
+  "archive_max_mb": 3000,
+  "scene_corr_max": 0.5
 }

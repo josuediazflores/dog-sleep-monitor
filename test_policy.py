@@ -11,15 +11,18 @@ Run: python test_policy.py
 from monitor import DEFAULTS, SleepState
 
 CFG = {**DEFAULTS, "quiet_score": 0.010, "active_score": 0.040,
-       "scene_change_score": 0.60, "quiet_samples_to_sleep": 12,
-       "active_samples_to_wake": 2}
+       "scene_change_score": 0.60, "scene_corr_max": 0.50,
+       "quiet_samples_to_sleep": 12, "active_samples_to_wake": 2}
 
-STILL, MOVE, DEAD, SCENE = 0.000, 0.100, 0.025, 0.900
+STILL, MOVE, DEAD = 0.000, 0.100, 0.025
+SCENE = (0.900, -0.80)   # huge and uncorrelated: the room re-lit
+BIG_DOG = (0.820, 0.93)  # huge but still correlated: a dog filling the frame
 
 
 def run(scores, start="unknown"):
+    """Scores may be plain floats, or (score, corr) pairs."""
     m = SleepState(CFG, state=start)
-    return [m.update(s) for s in scores]
+    return [m.update(*s) if isinstance(s, tuple) else m.update(s) for s in scores]
 
 
 def check(name, got, want):
@@ -63,6 +66,13 @@ def main():
     r = run([MOVE, SCENE, MOVE], start="asleep")
     results.append(check("scene change resets the active run", r[-1][0], "asleep"))
     results.append(check("scene change is tagged, not scored", r[1][1], "scene"))
+
+    # The live failure this guard originally caused: a dog close to the camera
+    # scored 0.82, tripped the magnitude-only scene test, and stayed "asleep"
+    # while visibly moving.
+    r = run([BIG_DOG, BIG_DOG], start="asleep")
+    results.append(check("huge but correlated change wakes", r[-1][0], "awake"))
+    results.append(check("...and is tagged as movement", r[0][1], "MOVING"))
 
     print(f"\n{sum(results)}/{len(results)} passed")
     return 0 if all(results) else 1
