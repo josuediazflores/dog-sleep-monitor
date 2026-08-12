@@ -19,6 +19,7 @@ import hmac
 import json
 import math
 import os
+import re
 import socket
 import sys
 import threading
@@ -718,6 +719,7 @@ def cmd_label(cfg, args):
     if end <= start:
         raise SystemExit("--to must be after --from.")
 
+    empty_windows = read_markers()
     rows, skipped = [], 0
     with open(log_path) as fh:
         for row in csv.DictReader(fh):
@@ -726,6 +728,9 @@ def cmd_label(cfg, args):
                 continue
             if row["changed"] == "scene-change":
                 skipped += 1  # not the dog, do not teach a threshold with it
+                continue
+            if in_empty_window(when, empty_windows):
+                skipped += 1  # no dog present; neither quiet-dog nor active-dog
                 continue
             rows.append((row["timestamp"], float(row["score"])))
 
@@ -848,20 +853,99 @@ def cmd_tune(cfg, args):
 
 # --- report ------------------------------------------------------------------
 
+MARKERS_PATH = os.path.join(HERE, "markers.csv")
+
+
+def read_markers():
+    """Manually marked pen-empty windows as a list of (start, end).
+
+    An empty pen is perfectly still, so the detector calls it sleep. No amount
+    of threshold tuning fixes that: stillness genuinely is what it measures.
+    Marking the window is the only source of truth, and it doubles as the
+    ground truth for building an automatic presence check later.
+
+    An unclosed `out` marker runs to now, so forgetting to mark her back in
+    fails toward "not sleep" rather than inventing hours of sleep.
+    """
+    if not os.path.exists(MARKERS_PATH):
+        return []
+    events = []
+    with open(MARKERS_PATH) as fh:
+        for r in csv.DictReader(fh):
+            events.append((datetime.fromisoformat(r["timestamp"]), r["kind"]))
+    events.sort()
+    windows, open_at = [], None
+    for when, kind in events:
+        if kind == "out" and open_at is None:
+            open_at = when
+        elif kind == "in" and open_at is not None:
+            windows.append((open_at, when))
+            open_at = None
+    if open_at is not None:
+        windows.append((open_at, datetime.now()))
+    return windows
+
+
+def in_empty_window(when, windows):
+    return any(a <= when <= b for a, b in windows)
+
+
 def read_log(cfg, start=None, end=None):
-    """Load the sample log as (when, score, state, changed) tuples."""
+    """Load the sample log as (when, score, state, changed) tuples.
+
+    Rows inside a marked pen-empty window get their state rewritten to "empty".
+    Applied here, at read time, so every consumer (report, tune, the API)
+    inherits it from one place while the log on disk stays raw.
+    """
     path = os.path.join(HERE, cfg["log_path"])
     if not os.path.exists(path):
         raise SystemExit(f"No log at {path}. Run `watch` first.")
+    windows = read_markers()
     rows = []
     with open(path) as fh:
         for r in csv.DictReader(fh):
             when = datetime.fromisoformat(r["timestamp"])
             if (start and when < start) or (end and when > end):
                 continue
-            rows.append((when, float(r["score"]), r["state"], r["changed"]))
+            state = "empty" if in_empty_window(when, windows) else r["state"]
+            rows.append((when, float(r["score"]), state, r["changed"]))
     rows.sort(key=lambda t: t[0])
     return rows
+
+
+def cmd_mark(cfg, args):
+    """Record that the pen is empty (`out`) or occupied again (`in`)."""
+    if args.at:
+        if "T" in args.at:
+            when = datetime.fromisoformat(args.at)
+        else:
+            fmt = "%H:%M" if args.at.count(":") == 1 else "%H:%M:%S"
+            when = datetime.combine(datetime.now().date(),
+                                    datetime.strptime(args.at, fmt).time())
+    else:
+        when = datetime.now()
+
+    is_new = not os.path.exists(MARKERS_PATH)
+    with open(MARKERS_PATH, "a", newline="") as fh:
+        wr = csv.writer(fh)
+        if is_new:
+            wr.writerow(["timestamp", "kind"])
+        wr.writerow([when.isoformat(timespec="seconds"), args.kind])
+
+    windows = read_markers()
+    if args.kind == "out":
+        print(f"  Pen marked EMPTY from {when:%H:%M:%S}.")
+        print("  Everything from here is excluded from sleep until you run:")
+        print("    .venv/bin/python monitor.py mark in")
+    else:
+        if windows:
+            a, b = windows[-1]
+            print(f"  Pen marked OCCUPIED at {when:%H:%M:%S}. Excluded "
+                  f"{human((b - a).total_seconds())} ({a:%H:%M} to {b:%H:%M}).")
+        else:
+            print(f"  Marked at {when:%H:%M:%S}, but no open 'out' marker found.")
+    total = sum((b - a).total_seconds() for a, b in windows)
+    print(f"  {len(windows)} empty window(s) on record, {human(total)} total.")
 
 
 def sessionize(rows, interval, gap_factor=3.0):
@@ -923,7 +1007,8 @@ def timeline_bar(sessions, gaps, width=64):
     t0 = min(s[0] for s in spans)
     t1 = max(s[1] for s in spans)
     total = max((t1 - t0).total_seconds(), 1.0)
-    glyph = {"asleep": "#", "awake": "~", "unknown": ".", "gap": " "}
+    glyph = {"asleep": "#", "awake": "~", "unknown": ".", "empty": "_",
+             "gap": " "}
     cells = []
     for i in range(width):
         a = t0 + timedelta(seconds=total * i / width)
@@ -965,6 +1050,9 @@ def cmd_report(cfg, args):
     gap_total = sum(g["duration"] for g in gaps)
     asleep = totals.get("asleep", 0.0)
     awake = totals.get("awake", 0.0)
+    empty = totals.get("empty", 0.0)
+    # Pen-empty time is excluded from the denominator: the dog was not there to
+    # be asleep or awake, so counting it either way would be a lie.
     monitored = asleep + awake + totals.get("unknown", 0.0)
 
     sleeps = [s for s in sessions if s["state"] == "asleep"]
@@ -979,12 +1067,16 @@ def cmd_report(cfg, args):
     bar, t0, t1 = timeline_bar(sessions, gaps)
     print(f"  {bar}")
     print(f"  {t0:%H:%M}{' ' * max(0, len(bar) - 11)}{t1:%H:%M}")
-    print("  # asleep   ~ awake   . warming up   (blank) no data\n")
+    print("  # asleep   ~ awake   _ pen empty   . warming up   "
+          "(blank) no data\n")
 
     print(f"  asleep        {human(asleep):>10}"
           f"   {100.0 * asleep / monitored if monitored else 0:>5.1f}% of monitored")
     print(f"  awake         {human(awake):>10}"
           f"   {100.0 * awake / monitored if monitored else 0:>5.1f}%")
+    if empty:
+        print(f"  pen empty     {human(empty):>10}"
+              f"   marked by hand, excluded from sleep")
     if gap_total:
         print(f"  NO DATA       {human(gap_total):>10}"
               f"   {len(gaps)} gap(s), monitor was not running")
@@ -1191,6 +1283,7 @@ def write_html_report(cfg, rows, sessions, gaps, args):
       <span><i style="background:var(--asleep)"></i>asleep</span>
       <span><i style="background:var(--awake)"></i>awake</span>
       <span><i style="background:var(--unknown)"></i>warming up</span>
+      <span><i style="background:var(--gap)"></i>pen empty</span>
       <span><i style="background:var(--gap)"></i>no data</span>
       <span>lower trace: raw motion score on a sqrt scale, 0 to
         {cap:.2f}; dashed lines are the quiet and active thresholds</span>
@@ -1247,7 +1340,14 @@ def consolidate_sleep(sessions, gaps, merge_s):
                 cur["partial"] = True
                 out.append(cur)
                 cur = None
-        elif state == "awake" and cur is not None and duration > merge_s:
+        elif state == "empty":
+            # Known to be dogless. Closes the sleep cleanly rather than partial:
+            # we know exactly when it ended, because she was taken out.
+            if cur is not None:
+                out.append(cur)
+                cur = None
+        elif state in ("awake", "unknown") and cur is not None \
+                and duration > merge_s:
             out.append(cur)
             cur = None
     if cur is not None:
@@ -1436,6 +1536,137 @@ def cmd_serve(cfg, args):
         httpd.server_close()
 
 
+# --- dataset -----------------------------------------------------------------
+
+ARCHIVE_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})_([0-9.]+)\.jpg$")
+
+
+def archive_index(cfg):
+    """Every archived frame as (when, score, filename), sorted by time."""
+    d = os.path.join(HERE, cfg["archive_dir"])
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for name in os.listdir(d):
+        m = ARCHIVE_NAME.match(name)
+        if not m:
+            continue
+        when = datetime.strptime(m.group(1), "%Y-%m-%dT%H-%M-%S")
+        out.append((when, float(m.group(2)), name))
+    out.sort()
+    return out
+
+
+def cmd_dataset(cfg, args):
+    """Export a stratified, leak-free sample of archived frames for labeling.
+
+    Deliberately does NOT export the monitor's asleep/awake decision as a label.
+    That decision comes from the thresholds a model would be used to check, so
+    training on it would only teach a model to imitate them. It is exported as
+    `weak_state`, clearly named, for stratification and for spotting
+    disagreements later.
+
+    The recommended label is dog present/absent, which is unambiguous from a
+    single frame and fixes the one thing motion detection structurally cannot
+    do: tell a sleeping dog from an empty pen.
+    """
+    frames = archive_index(cfg)
+    if not frames:
+        raise SystemExit(
+            f"No archived frames in {cfg['archive_dir']}/.\n"
+            'Set "archive_all_samples": true in config.json and run `watch`.')
+
+    # Weak state per timestamp, from the log.
+    rows = read_log(cfg)
+    by_time = {w.replace(microsecond=0): (s, st) for w, s, st, _c in rows}
+
+    t0, t1 = frames[0][0], frames[-1][0]
+    block = timedelta(minutes=args.block_minutes)
+
+    def block_of(when):
+        return int((when - t0) / block)
+
+    # Splits are assigned per contiguous time block, never per frame. Frames 5s
+    # apart are near-duplicates, so a random split would put the same moment in
+    # train and test and report a meaningless accuracy.
+    #
+    # val/test blocks are spread evenly across the whole period rather than
+    # taken from the end, so each split sees both day and night. A purely
+    # chronological split of a day-and-night recording would put every night
+    # frame in test, which measures distribution shift rather than the model.
+    nblocks = block_of(t1) + 1
+    n_test = max(1, round(0.15 * nblocks))
+    n_val = max(1, round(0.15 * nblocks)) if nblocks >= 3 else 0
+    split_of = {b: "train" for b in range(nblocks)}
+    if nblocks >= 2:
+        for i in range(n_test):
+            split_of[round((i + 0.5) * nblocks / n_test) % nblocks] = "test"
+        for i in range(n_val):
+            b = round((i + 0.25) * nblocks / max(1, n_val)) % nblocks
+            if split_of[b] == "train":
+                split_of[b] = "val"
+
+    # Stratify on (weak_state, dark) so a night of sleep cannot swamp the
+    # sample, and so the rare cases survive into it.
+    strata = {}
+    for when, score, name in frames:
+        weak = by_time.get(when.replace(microsecond=0), (None, "unknown"))[1]
+        dark = when.hour >= 20 or when.hour < 6
+        strata.setdefault((weak, dark), []).append((when, score, name))
+
+    per = max(1, args.limit // max(1, len(strata)))
+    picked = []
+    for key, items in sorted(strata.items(), key=lambda kv: str(kv[0])):
+        step = max(1, len(items) // per)
+        picked.extend(items[::step][:per])
+    picked.sort()
+
+    out_dir = os.path.join(HERE, args.out)
+    os.makedirs(out_dir, exist_ok=True)
+    manifest = os.path.join(out_dir, "manifest.csv")
+    with open(manifest, "w", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(["file", "timestamp", "score", "weak_state", "dark",
+                     "block", "split", "label_dog_present", "label_notes"])
+        for when, score, name in picked:
+            weak = by_time.get(when.replace(microsecond=0), (None, "unknown"))[1]
+            b = block_of(when)
+            wr.writerow([os.path.join(cfg["archive_dir"], name), when.isoformat(),
+                         f"{score:.6f}", weak,
+                         "1" if (when.hour >= 20 or when.hour < 6) else "0",
+                         b, split_of[b], "", ""])
+
+    counts = {}
+    for when, _s, _n in picked:
+        counts[split_of[block_of(when)]] = counts.get(split_of[block_of(when)], 0) + 1
+
+    print(f"  archive spans {t0:%Y-%m-%d %H:%M} to {t1:%H:%M}, "
+          f"{len(frames)} frames")
+    print(f"  sampled {len(picked)} across {len(strata)} strata "
+          f"(weak_state x day/night)")
+    print(f"  {nblocks} time blocks of {args.block_minutes} min; splits assigned "
+          f"per block, not per frame")
+    for k in ("train", "val", "test"):
+        blocks = sorted(b for b, s in split_of.items() if s == k)
+        print(f"    {k:<6}{counts.get(k, 0):>6} frames   blocks {blocks}")
+    if nblocks < 6:
+        print(f"\n  WARNING: only {nblocks} time blocks, so each split is one or two\n"
+              f"  contiguous stretches. Any accuracy measured on this is a very\n"
+              f"  coarse estimate. Collect more hours, or lower --block-minutes\n"
+              f"  only if you are sure movement is uncorrelated at that scale.")
+    if any(counts.get(k, 0) == 0 for k in ("train", "val", "test")):
+        print("\n  WARNING: a split came out empty. Collect more data.")
+    print(f"\n  strata present:")
+    for key, items in sorted(strata.items(), key=lambda kv: str(kv[0])):
+        weak, dark = key
+        print(f"    {weak:<9}{'night' if dark else 'day':<7}{len(items):>6} available")
+    print(f"\n  Wrote {manifest}")
+    print("  Fill in label_dog_present with 1 or 0. The images stay where they "
+          "are;\n  the manifest only references them.")
+    print("\n  NOTE: weak_state is the monitor's own decision, derived from the\n"
+          "  thresholds a model would be used to check. Do not train on it.")
+
+
 # --- purge -------------------------------------------------------------------
 
 PURGE_TARGETS = {
@@ -1622,7 +1853,17 @@ def main():
     p.add_argument("--to", dest="end", required=True, help="HH:MM, HH:MM:SS or ISO")
     p.add_argument("--label", choices=["quiet", "active"], required=True)
 
+    p = sub.add_parser("mark", help="mark the pen empty/occupied by hand")
+    p.add_argument("kind", choices=["out", "in"])
+    p.add_argument("--at", help="HH:MM, HH:MM:SS or ISO; default now")
+
     sub.add_parser("tune", help="grid-search thresholds against labeled data")
+
+    p = sub.add_parser("dataset", help="export archived frames for labeling")
+    p.add_argument("--limit", type=int, default=600, help="frames to sample")
+    p.add_argument("--block-minutes", type=int, default=20,
+                   help="split granularity; must exceed any autocorrelation")
+    p.add_argument("--out", default="dataset", help="output directory")
 
     p = sub.add_parser("serve", help="read-only JSON API for the iOS app")
     p.add_argument("--bind", help="interface to bind (default 127.0.0.1)")
@@ -1652,6 +1893,8 @@ def main():
      "label": cmd_label,
      "tune": cmd_tune,
      "purge": cmd_purge,
+     "dataset": cmd_dataset,
+     "mark": cmd_mark,
      "report": cmd_report,
      "serve": cmd_serve,
      "doctor": cmd_doctor}[args.cmd](cfg, args)
