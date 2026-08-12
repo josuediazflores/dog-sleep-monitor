@@ -252,6 +252,35 @@ dawn.
 | `scene-change` firing often | Raise `scene_change_score`, or stop the camera from being nudged. |
 | Feed drops constantly | Move to `/stream2`, or improve the camera's Wi-Fi signal. |
 
+## Reading the results
+
+```bash
+.venv/bin/python monitor.py report                 # terminal summary
+.venv/bin/python monitor.py report --html          # also writes report.html
+.venv/bin/python monitor.py report --from 22:00 --to 08:00 --all
+```
+
+`report` collapses per-sample rows into **sessions**: runs of one state with a
+start, an end, a duration, and the mean and max score over the run. On top of
+that:
+
+- **Stirs vs wakes.** An awake span shorter than `--min-wake` (default 2 min) is
+  a stir, not a wake. Counted separately and hidden from the table unless
+  `--all`, because "she woke 14 times" and "she stirred 12 times and woke twice"
+  describe the same night very differently.
+- **Gaps are never bridged.** A stretch with no samples means the monitor was not
+  running: laptop asleep, process dead, feed down. Bridging two sleep sessions
+  across a four-hour outage would invent four hours of sleep, so gaps are their
+  own row type and are excluded from the percentages.
+- **A high max on an asleep session is normal.** Waking needs 2 consecutive
+  samples to confirm, so the first movement sample is still filed under the
+  previous state. That max is the movement that ended the session.
+
+`--html` writes a self-contained page: stat cards, a hypnogram band, and the raw
+score trace beneath it with the thresholds drawn in. The trace uses a sqrt scale
+because scores span three orders of magnitude, from 0.0000 to 0.82, and a linear
+axis either clips the peaks or flattens the sleep periods into one pixel row.
+
 ## Stored data
 
 Numbers are small and permanent. Images are large and temporary.
