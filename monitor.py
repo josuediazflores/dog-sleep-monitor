@@ -338,7 +338,7 @@ def open_camera(cfg):
     raise SystemExit(f'Unknown source {source!r}. Use "rtsp" or "usb".')
 
 
-def open_camera_waiting(cfg, exit_after=0.0, retry=15.0):
+def open_camera_waiting(cfg, exit_after=0.0, retry=15.0, beat=None):
     """Open the camera, waiting for it to appear rather than giving up.
 
     A camera that is briefly unreachable at startup must not be fatal for a
@@ -346,11 +346,19 @@ def open_camera_waiting(cfg, exit_after=0.0, retry=15.0):
     watching, but if the host reboots during an outage then a fail-fast `watch`
     declines to run and stays dead until someone notices. That is a worse
     failure than the outage.
+
+    `beat` is pulsed on every retry. This loop can run for the full
+    `exit_after` window, so without it a monitor patiently waiting for an
+    unplugged camera looks -- to anything reading the heartbeat -- exactly like
+    a monitor that has died. That is the one distinction the heartbeat exists
+    to make, so it has to survive the startup path too.
     """
     started = time.monotonic()
     attempt = 0
     while True:
         try:
+            if beat:
+                beat.beat(feed_ok=False)
             cam = open_camera(cfg)
             if attempt:
                 print(f"{stamp()}  camera available after "
@@ -371,7 +379,15 @@ def open_camera_waiting(cfg, exit_after=0.0, retry=15.0):
             elif attempt % 4 == 0:
                 print(f"{stamp()}  still waiting for the camera, "
                       f"{human(waited)} so far")
-            time.sleep(retry)
+            # Pulse through the wait, not just once per attempt: `retry` is
+            # 15s and the liveness window is 3 sample intervals.
+            slept = 0.0
+            while slept < retry:
+                if beat:
+                    beat.beat(feed_ok=False)
+                nap = min(5.0, retry - slept)
+                time.sleep(nap)
+                slept += nap
 
 
 # --- the math ----------------------------------------------------------------
@@ -1713,15 +1729,27 @@ def sleep_events(cfg, since=None, min_minutes=None, merge_minutes=None):
 
 
 def frame_status(cfg):
-    """Age and availability of the current frame, without reading the jpeg."""
+    """Age and availability of the current frame, without reading the jpeg.
+
+    `path` reports what is *configured*, never whether the file happens to
+    exist -- those are different failures and deserve different messages.
+    Conflating them made a monitor that simply had not sampled yet report
+    "latest_frame is not configured", which sends you to the config file to
+    fix something that is not broken.
+    """
     name = cfg.get("latest_frame") or ""
-    path = os.path.join(HERE, name) if name else None
-    if not path or not os.path.exists(path):
-        return {"available": False, "ts": None, "age_s": None, "path": None}
+    if not name:
+        return {"available": False, "ts": None, "age_s": None,
+                "path": None, "configured": False}
+    path = os.path.join(HERE, name)
+    if not os.path.exists(path):
+        return {"available": False, "ts": None, "age_s": None,
+                "path": name, "configured": True}
     try:
         mtime = datetime.fromtimestamp(os.path.getmtime(path))
     except OSError:
-        return {"available": False, "ts": None, "age_s": None, "path": None}
+        return {"available": False, "ts": None, "age_s": None,
+                "path": name, "configured": True}
     age = (datetime.now() - mtime).total_seconds()
     max_age = float(cfg.get("frame_max_age_s") or 0)
     return {
@@ -1732,6 +1760,7 @@ def frame_status(cfg):
         "ts": iso(mtime),
         "age_s": int(age),
         "path": name,
+        "configured": True,
     }
 
 
@@ -1895,12 +1924,16 @@ def make_handler(cfg, token):
 
             if path in ("/v1/frame.jpg", "/v1/frame"):
                 frame = frame_status(cfg)
-                if not frame["path"]:
+                if not frame["configured"]:
                     return self._send(404, {"error": "latest_frame is not configured"})
                 if frame["ts"] is None:
+                    # Configured but nothing written yet: watch has not taken a
+                    # sample since it started, usually because the camera has
+                    # not answered. 503 rather than 404 -- the route exists and
+                    # is expected to work later.
                     return self._send(503, {
                         "error": "no frame yet",
-                        "hint": "watch has not produced a sample",
+                        "hint": "watch has not produced a sample since starting",
                     })
                 if not frame["available"]:
                     # Deliberately refuse rather than serve a stale picture as
@@ -2345,10 +2378,11 @@ def cmd_watch(cfg, args):
               "  Run `reference` while the pen is empty to fix that.")
 
     exit_after = 60.0 * float(getattr(args, "exit_after_feed_down", 0) or 0)
-    cam = open_camera_waiting(cfg, exit_after=exit_after)
-    # Beat once before the first sample. Otherwise a reader that polls in the
-    # first ~10s sees no heartbeat and reports the monitor dead while it is in
-    # fact starting up normally.
+    # Beat before opening the camera, and keep beating while waiting for it.
+    # open_camera_waiting can block for the whole exit_after window, and a
+    # monitor waiting on an unplugged camera must not read as a dead monitor.
+    beat.beat(feed_ok=False)
+    cam = open_camera_waiting(cfg, exit_after=exit_after, beat=beat)
     beat.beat(feed_ok=True)
     machine = SleepState(cfg)
     prev = None
