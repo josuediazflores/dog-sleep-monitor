@@ -1,0 +1,34 @@
+# Read-only JSON API. Copy to /etc/systemd/system/ and:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dog-monitor-api
+#
+# Requires MONITOR_API_TOKEN (>=24 chars) in .env. Generate it ON this machine:
+#   echo "MONITOR_API_TOKEN=$(openssl rand -hex 32)" >> .env
+# Do that BEFORE enabling: cmd_serve refuses to start without one, and with
+# Restart=always that is a 3-second crash loop spamming the journal forever.
+
+[Unit]
+Description=Dog sleep monitor - read-only JSON API
+# Deliberately NOT After= or Requires= the watch unit. Its entire value when
+# things break is answering while watch is down -- /v1/state reporting
+# "monitor dead for 6 minutes" is far more useful than connection refused.
+#
+# Also no network-online: it binds loopback, so it has nothing to wait for.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=josue
+Group=josue
+WorkingDirectory=/home/josue/dog-sleep-monitor
+EnvironmentFile=-/home/josue/dog-sleep-monitor/.env
+# Binds 127.0.0.1 per config.json. Keep it there: the collector runs on this
+# same Pi, so loopback means no LAN exposure, no bearer token on the wire, and
+# no CORS. The camera stills never leave the box except through a surface we
+# control.
+ExecStart=/usr/bin/python3 -u monitor.py serve
+Restart=always
+RestartSec=3
+SyslogIdentifier=dog-api
+
+[Install]
+WantedBy=multi-user.target

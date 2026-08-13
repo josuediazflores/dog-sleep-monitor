@@ -1,0 +1,47 @@
+# Capture and classify. Copy to /etc/systemd/system/ and:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dog-monitor-watch
+#
+# Replaces the hand-rolled watch.pid + `sleep N; kill -INT` watchdog, which did
+# not survive a reboot and which killed the monitor on a timer without
+# restarting it.
+
+[Unit]
+Description=Dog sleep monitor - capture and classify
+# network-online, not network: the Pi is on wlan0 and the radio is not up when
+# network.target fires, so without this the first camera connect always fails.
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+# time-sync matters because a Pi has no RTC battery and boots at its last known
+# time. Every timestamp this program writes is naive local time, so pre-NTP
+# rows get silently sorted into the past by read_log -- it invents and erases
+# history without complaining.
+#
+# Disable the start rate limiter. The default (5 starts / 10s) will not trip at
+# these intervals, but if it ever did the unit enters `failed` and never comes
+# back. For a monitor that is the worst available failure mode.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=josue
+Group=josue
+WorkingDirectory=/home/josue/dog-sleep-monitor
+# The `-` makes a missing file non-fatal. load_env() already reads .env from
+# the script directory, so this is belt-and-braces -- but it keeps the
+# dependency visible in `systemctl cat`, and it beats Environment=, whose
+# values are printed by `systemctl show`.
+EnvironmentFile=-/home/josue/dog-sleep-monitor/.env
+# -u because Python block-buffers stdout into journald otherwise and
+# `journalctl -f` looks dead for minutes at a time.
+#
+# --exit-after-feed-down is what makes Restart=always worth having: by default
+# watch retries inside one process forever, so a wedged ffmpeg context never
+# clears. Exiting after 10 minutes of a dead feed lets systemd hand back a
+# genuinely fresh process, which is often the only cure.
+ExecStart=/usr/bin/python3 -u monitor.py watch --exit-after-feed-down 10
+Restart=always
+RestartSec=5
+SyslogIdentifier=dog-watch
+
+[Install]
+WantedBy=multi-user.target
