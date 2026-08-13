@@ -15,11 +15,18 @@ preview.jpg
 *.mp4
 
 # --- captured data ---
-sleep_log.csv
-events.csv
-calibration.csv
-calibration.*.csv
+# Globs, not filenames. These files record when the home is unattended, and
+# this repo is public. Listing exact names let `sleep_log.pi.csv` (a copy
+# pulled off the Pi) sit untracked-but-not-ignored, one `git add -A` away
+# from being published. Match by extension so a renamed copy cannot escape.
+*.csv
+!config.example.json
 watch.out
+*.log
+
+# Scratch for anything pulled off the Pi or backed up locally. Never tracked.
+.local/
+.backup-*/
 
 # --- python ---
 .venv/
