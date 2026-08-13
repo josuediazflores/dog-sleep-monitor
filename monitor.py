@@ -1020,7 +1020,17 @@ def read_log(cfg, start=None, end=None):
             state = "empty" if in_empty_window(when, windows) else r["state"]
             rows.append((when, float(r["score"]), state, r["changed"]))
     rows.sort(key=lambda t: t[0])
-    return rows
+
+    # Drop repeated timestamps, keeping the first. Handing a log over between
+    # machines appends rows that overlap the ones already there, and a doubled
+    # sample would be counted twice in a session's mean and sample count.
+    deduped, seen = [], set()
+    for row in rows:
+        if row[0] in seen:
+            continue
+        seen.add(row[0])
+        deduped.append(row)
+    return deduped
 
 
 def cmd_mark(cfg, args):
