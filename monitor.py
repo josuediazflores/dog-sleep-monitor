@@ -321,6 +321,42 @@ def open_camera(cfg):
     raise SystemExit(f'Unknown source {source!r}. Use "rtsp" or "usb".')
 
 
+def open_camera_waiting(cfg, exit_after=0.0, retry=15.0):
+    """Open the camera, waiting for it to appear rather than giving up.
+
+    A camera that is briefly unreachable at startup must not be fatal for a
+    monitor. Failing fast is right for `doctor` and `preview`, which a person is
+    watching, but if the host reboots during an outage then a fail-fast `watch`
+    declines to run and stays dead until someone notices. That is a worse
+    failure than the outage.
+    """
+    started = time.monotonic()
+    attempt = 0
+    while True:
+        try:
+            cam = open_camera(cfg)
+            if attempt:
+                print(f"{stamp()}  camera available after "
+                      f"{human(time.monotonic() - started)}, starting")
+            return cam
+        except SystemExit as exc:
+            attempt += 1
+            waited = time.monotonic() - started
+            if exit_after and waited >= exit_after:
+                print(f"{stamp()}  camera still unavailable after "
+                      f"{human(waited)}, giving up")
+                raise
+            if attempt == 1:
+                first = str(exc).splitlines()[0]
+                print(f"{stamp()}  camera unavailable: {first}")
+                print(f"{stamp()}  retrying every {retry:.0f}s. Collection starts "
+                      f"as soon as it answers.")
+            elif attempt % 4 == 0:
+                print(f"{stamp()}  still waiting for the camera, "
+                      f"{human(waited)} so far")
+            time.sleep(retry)
+
+
 # --- the math ----------------------------------------------------------------
 
 def roi_pixels(roi, width, height):
@@ -1922,7 +1958,7 @@ def cmd_watch(cfg, args):
               f"(~39MB/hour, hard cap {archive.cap_mb:.0f}MB, "
               f"{archive.used_mb:.0f}MB already there).")
 
-    cam = open_camera(cfg)
+    cam = open_camera_waiting(cfg, exit_after=exit_after)
     machine = SleepState(cfg)
     prev = None
     next_at = time.monotonic()
