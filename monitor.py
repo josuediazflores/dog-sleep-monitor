@@ -29,7 +29,15 @@ from datetime import datetime, timedelta, timezone
 
 # Must be set before the first VideoCapture. UDP loses packets over Wi-Fi and
 # produces torn frames that read as motion; TCP does not.
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+# UDP loses packets over Wi-Fi and produces torn frames that read as motion;
+# TCP does not. The timeouts matter more than they look: without them a stalled
+# RTSP connection blocks cap.read() indefinitely, so the drain thread's
+# reconnect logic can never run and the feed stays dead while the process looks
+# healthy. Both spellings are set because ffmpeg renamed stimeout to timeout;
+# the unused one is ignored.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000|timeout;5000000")
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
@@ -1920,6 +1928,9 @@ def cmd_watch(cfg, args):
     next_at = time.monotonic()
     taken = 0
     limit = int(getattr(args, "samples", 0) or 0)
+    feed_down_since = None
+    last_feed_note = 0.0
+    exit_after = 60.0 * float(getattr(args, "exit_after_feed_down", 0) or 0)
 
     try:
         while limit == 0 or taken < limit:
@@ -1928,12 +1939,35 @@ def cmd_watch(cfg, args):
             try:
                 cur, raw = grab_sample(cam, cfg, keep_raw=True)
             except RuntimeError as exc:
-                # Feed hiccup. The reader thread reconnects on its own; drop the
-                # stale reference so the next good frame starts a fresh pair.
-                print(f"{stamp()}  feed: {exc}")
-                record("feed-drop", 0.0, None)
+                # The reader thread reconnects on its own; drop the stale
+                # reference so the next good frame starts a fresh pair.
+                #
+                # One event per outage, not one per sample. A camera that fell
+                # off the network for 15 minutes previously wrote 184 identical
+                # rows, which buried the signal it was supposed to carry.
+                now = time.monotonic()
+                if feed_down_since is None:
+                    feed_down_since = now
+                    last_feed_note = now
+                    record("feed-down", 0.0, None)
+                    print(f"{stamp()}  FEED DOWN: {exc}")
+                elif now - last_feed_note >= 60.0:
+                    last_feed_note = now
+                    down_for = now - feed_down_since
+                    print(f"{stamp()}  feed still down, {human(down_for)} so far")
+                    if exit_after and down_for >= exit_after:
+                        print(f"{stamp()}  giving up after {human(down_for)}. "
+                              f"Nothing has been recorded since the feed died, so "
+                              f"exiting loudly beats spinning quietly.")
+                        raise SystemExit(3)
                 prev = None
                 continue
+
+            if feed_down_since is not None:
+                down_for = time.monotonic() - feed_down_since
+                record("feed-up", 0.0, raw)
+                print(f"{stamp()}  FEED BACK after {human(down_for)}")
+                feed_down_since = None
 
             if prev is None:
                 prev = cur
@@ -1992,6 +2026,9 @@ def main():
     p = sub.add_parser("watch", help="run the monitor")
     p.add_argument("--samples", type=int, default=0,
                    help="stop after N samples (0 = run forever)")
+    p.add_argument("--exit-after-feed-down", type=float, default=0, metavar="MIN",
+                   help="exit non-zero if the camera feed stays down this long "
+                        "(0 = never exit, keep retrying)")
 
     p = sub.add_parser("label", help="tag a window of the live log quiet/active")
     p.add_argument("--from", dest="start", required=True, help="HH:MM, HH:MM:SS or ISO")
