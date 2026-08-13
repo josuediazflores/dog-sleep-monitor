@@ -1968,6 +1968,18 @@ def cmd_watch(cfg, args):
               f"(~39MB/hour, hard cap {archive.cap_mb:.0f}MB, "
               f"{archive.used_mb:.0f}MB already there).")
 
+    # Presence turns "still" into "asleep" or "away". Without references the
+    # machine falls back to motion only, which reports an empty pen as sleep:
+    # measured overnight, that cost 12 minutes of invented sleep on 2026-08-13.
+    references = load_references(cfg)
+    if references:
+        print(f"Presence: {len(references)} empty-pen reference(s) "
+              f"({', '.join(n for n, _ in references)}), threshold "
+              f"{cfg['presence_threshold']}.")
+    else:
+        print("Presence: NO references, so an empty pen will read as asleep.\n"
+              "  Run `reference` while the pen is empty to fix that.")
+
     exit_after = 60.0 * float(getattr(args, "exit_after_feed_down", 0) or 0)
     cam = open_camera_waiting(cfg, exit_after=exit_after)
     machine = SleepState(cfg)
@@ -2021,9 +2033,10 @@ def cmd_watch(cfg, args):
 
             score = motion_score(prev, cur, cfg["pixel_threshold"])
             corr = correlation(prev, cur)
+            pres, _ref = presence_score(cur, references, cfg["pixel_threshold"])
             prev = cur
 
-            state, tag, changed = machine.update(score, corr)
+            state, tag, changed = machine.update(score, corr, pres)
             archive.save(raw, score)
 
             if time.monotonic() >= next_snap:
@@ -2046,8 +2059,10 @@ def cmd_watch(cfg, args):
                 print(f"{stamp()}  --> {state.upper()}"
                       + (f"  [{shot}]" if shot else ""))
             elif cfg["print_every_sample"]:
+                pres_txt = f"  pres {pres:.3f}" if pres is not None else ""
                 print(f"{stamp()}  score {score:.4f}  {tag:<6} "
-                      f"quiet {machine.quiet_run}/{quiet_needed}  state {state}")
+                      f"quiet {machine.quiet_run}/{quiet_needed}  "
+                      f"state {state}{pres_txt}")
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
