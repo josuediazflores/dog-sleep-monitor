@@ -136,7 +136,22 @@ DEFAULTS = {
     "archive_dir": "archive",
     "archive_scale": 0.5,
     "archive_quality": 80,
-    "archive_max_mb": 3000,          # hard stop, so it cannot fill the disk
+    "archive_max_mb": 3000,          # ring buffer target; oldest frames drop
+
+    # A single always-current frame at a stable path, rewritten atomically on
+    # every sample. Deliberately independent of the archive: a consumer that
+    # globbed the newest file out of archive/ would break the moment archiving
+    # is turned off or the ring starts pruning, and would have to scan tens of
+    # thousands of dirents to do it.
+    "latest_frame": "latest.jpg",
+    "latest_frame_scale": 0.5,
+    "latest_frame_quality": 80,
+    "frame_max_age_s": 3600,         # past this, serve 503 instead of a lie
+
+    # Liveness. The API reads files on disk and cannot otherwise tell whether
+    # `watch` is running -- so "asleep for 6 hours" and "nothing has been
+    # watching for 6 hours" look identical without this.
+    "heartbeat_file": "heartbeat.json",
 
     # read-only JSON API for the iOS app to pull from
     "api_bind": "127.0.0.1",         # set to the tailnet IP to reach the phone
@@ -144,6 +159,7 @@ DEFAULTS = {
     "api_token_env": "MONITOR_API_TOKEN",
     "api_min_session_minutes": 10,   # shorter stretches are not "a sleep"
     "api_merge_stirs_minutes": 10,   # awake gaps below this merge into one sleep
+    "api_log_tail_bytes": 131072,    # live_state reads only the tail; 0 = all
 }
 
 
@@ -557,6 +573,119 @@ class FrameArchive:
         except OSError:
             pass
         return path
+
+
+def _write_atomic(path, write_bytes):
+    """Write via a temp file in the same directory, then os.replace().
+
+    os.replace is atomic on POSIX when both paths are on one filesystem, so a
+    reader either sees the whole old file or the whole new one -- never a
+    half-written frame. Without this a dashboard polling every 10s eventually
+    catches a torn jpeg, and the failure is invisible: the <img> fires onerror,
+    the canvas is never painted, and the panel just goes blank sometimes.
+    """
+    tmp = f"{path}.tmp"
+    try:
+        write_bytes(tmp)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+class LatestFrame:
+    """Keeps one current frame at a fixed path, rewritten atomically.
+
+    Separate from FrameArchive on purpose. The archive is a rolling review
+    buffer whose filenames are timestamps; serving "the newest file in it"
+    would mean scanning the whole directory per request and would break the
+    moment archiving is disabled or the ring prunes the file mid-read. This is
+    one known path, always current, independent of all of that.
+
+    The image is the same clean frame the archive gets -- no ROI rectangle. The
+    green box drawn on snapshots is a debugging aid and has no business on a
+    dashboard.
+    """
+
+    def __init__(self, cfg):
+        name = cfg.get("latest_frame") or ""
+        self.path = os.path.join(HERE, name) if name else None
+        self.scale = float(cfg["latest_frame_scale"])
+        self.quality = int(cfg["latest_frame_quality"])
+
+    def save(self, frame):
+        if not self.path:
+            return False
+        img = frame if self.scale >= 0.999 else cv2.resize(
+            frame, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
+        return _write_atomic(
+            self.path,
+            lambda tmp: cv2.imwrite(tmp, img, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]),
+        )
+
+
+class Heartbeat:
+    """Proof that `watch` is alive, written every loop iteration.
+
+    This exists because the API reads CSVs off disk and knows nothing about
+    whether anything is producing them. `live_state` can already tell that the
+    newest sample is old, but not *why*: a dead process and a dead camera look
+    identical from the log, because the feed-down branch continues without
+    writing a row. Those need different words on a dashboard -- one is "the
+    camera is unplugged", the other is "nothing has been watching".
+
+    So this is written on EVERY iteration including the feed-down path, and
+    carries feed_ok to separate the two cases.
+    """
+
+    def __init__(self, cfg):
+        name = cfg.get("heartbeat_file") or ""
+        self.path = os.path.join(HERE, name) if name else None
+        self.started_at = datetime.now()
+        self.feed_down_since = None
+
+    def beat(self, feed_ok, last_sample_at=None, state=None):
+        if not self.path:
+            return
+        now = datetime.now()
+        if feed_ok:
+            self.feed_down_since = None
+        elif self.feed_down_since is None:
+            self.feed_down_since = now
+        payload = {
+            "pid": os.getpid(),
+            "started_at": self.started_at.isoformat(timespec="seconds"),
+            "beat_at": now.isoformat(timespec="seconds"),
+            "last_sample_at": last_sample_at.isoformat(timespec="seconds")
+            if last_sample_at else None,
+            "feed_ok": bool(feed_ok),
+            "feed_down_since": self.feed_down_since.isoformat(timespec="seconds")
+            if self.feed_down_since else None,
+            "state": state,
+        }
+        _write_atomic(
+            self.path,
+            lambda tmp: open(tmp, "w").write(json.dumps(payload)),
+        )
+
+
+def read_heartbeat(cfg):
+    """Load the heartbeat, or None. Never raises -- a missing or corrupt
+    heartbeat means "cannot confirm the monitor is alive", which is exactly
+    what the caller should report."""
+    name = cfg.get("heartbeat_file") or ""
+    if not name:
+        return None
+    path = os.path.join(HERE, name)
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
 
 
 def prune_snapshots(cfg):
@@ -1038,25 +1167,70 @@ def in_empty_window(when, windows):
     return any(a <= when <= b for a, b in windows)
 
 
-def read_log(cfg, start=None, end=None):
+def _tail_lines(path, tail_bytes):
+    """Return the last whole lines of a file, plus the header line.
+
+    The first line read after seeking is almost certainly a partial row, so it
+    is discarded. The real header is read separately from the top so DictReader
+    still has field names.
+    """
+    with open(path) as fh:
+        header = fh.readline()
+        start = fh.tell()
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        if size - start <= tail_bytes:
+            fh.seek(start)
+            return [header] + fh.readlines()
+        fh.seek(size - tail_bytes)
+        fh.readline()  # discard the partial line the seek landed inside
+        return [header] + fh.readlines()
+
+
+def read_log(cfg, start=None, end=None, tail_bytes=0):
     """Load the sample log as (when, score, state, changed) tuples.
 
     Rows inside a marked pen-empty window get their state rewritten to "empty".
     Applied here, at read time, so every consumer (report, tune, the API)
     inherits it from one place while the log on disk stays raw.
+
+    `tail_bytes` reads only the end of the file. `live_state` needs the last
+    session and nothing else, but a dashboard polling every 10s would otherwise
+    re-parse the whole log 8,640 times a day -- already 588KB and growing
+    ~640KB/day, so this degrades quietly for months and then stops being
+    quiet. `/v1/events` still reads everything, because it legitimately needs
+    to.
     """
     path = os.path.join(HERE, cfg["log_path"])
     if not os.path.exists(path):
         raise SystemExit(f"No log at {path}. Run `watch` first.")
     windows = read_markers()
     rows = []
-    with open(path) as fh:
-        for r in csv.DictReader(fh):
-            when = datetime.fromisoformat(r["timestamp"])
+    if tail_bytes and tail_bytes > 0:
+        source = _tail_lines(path, tail_bytes)
+        reader = csv.DictReader(source)
+    else:
+        fh = open(path)
+        source = fh
+        reader = csv.DictReader(fh)
+    try:
+        for r in reader:
+            # A flush that straddles the write buffer boundary leaves a torn
+            # final row on disk -- roughly every 15 minutes of exposure. Left
+            # unguarded, fromisoformat raises and takes the whole request with
+            # it. One malformed row is not worth a 500.
+            try:
+                when = datetime.fromisoformat(r["timestamp"])
+                score = float(r["score"])
+            except (TypeError, ValueError, KeyError):
+                continue
             if (start and when < start) or (end and when > end):
                 continue
             state = "empty" if in_empty_window(when, windows) else r["state"]
-            rows.append((when, float(r["score"]), state, r["changed"]))
+            rows.append((when, score, state, r["changed"]))
+    finally:
+        if not (tail_bytes and tail_bytes > 0):
+            source.close()
     rows.sort(key=lambda t: t[0])
 
     # Drop repeated timestamps, keeping the first. Handing a log over between
@@ -1538,12 +1712,90 @@ def sleep_events(cfg, since=None, min_minutes=None, merge_minutes=None):
     return events
 
 
+def frame_status(cfg):
+    """Age and availability of the current frame, without reading the jpeg."""
+    name = cfg.get("latest_frame") or ""
+    path = os.path.join(HERE, name) if name else None
+    if not path or not os.path.exists(path):
+        return {"available": False, "ts": None, "age_s": None, "path": None}
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(path))
+    except OSError:
+        return {"available": False, "ts": None, "age_s": None, "path": None}
+    age = (datetime.now() - mtime).total_seconds()
+    max_age = float(cfg.get("frame_max_age_s") or 0)
+    return {
+        # Available means "worth showing", not "the file exists". Past the max
+        # age the frame is last night's picture and presenting it as current
+        # would be the exact fiction the rest of this design avoids.
+        "available": max_age <= 0 or age <= max_age,
+        "ts": iso(mtime),
+        "age_s": int(age),
+        "path": name,
+    }
+
+
+def monitor_status(cfg):
+    """Whether `watch` is actually running, and whether its camera is up.
+
+    Read from the heartbeat rather than inferred from the log. The log cannot
+    answer this: the feed-down path writes no row, so a dead camera and a dead
+    process both look like "no recent samples". Those need different words.
+    """
+    hb = read_heartbeat(cfg)
+    interval = float(cfg["sample_seconds"])
+    if not hb:
+        return {"alive": False, "reason": "no heartbeat file",
+                "pid": None, "beat_age_s": None, "feed_ok": None,
+                "feed_down_for_s": None, "uptime_s": None}
+    try:
+        beat_at = datetime.fromisoformat(hb["beat_at"])
+    except (KeyError, ValueError):
+        return {"alive": False, "reason": "unreadable heartbeat",
+                "pid": hb.get("pid"), "beat_age_s": None, "feed_ok": None,
+                "feed_down_for_s": None, "uptime_s": None}
+
+    beat_age = (datetime.now() - beat_at).total_seconds()
+    # Three intervals of slack: one missed beat is a slow sample, three is a
+    # process that is gone or wedged.
+    alive = beat_age <= 3 * interval
+
+    down_for = None
+    if hb.get("feed_down_since"):
+        try:
+            down_for = int((datetime.now()
+                            - datetime.fromisoformat(hb["feed_down_since"])).total_seconds())
+        except ValueError:
+            down_for = None
+
+    uptime = None
+    if hb.get("started_at"):
+        try:
+            uptime = int((datetime.now()
+                          - datetime.fromisoformat(hb["started_at"])).total_seconds())
+        except ValueError:
+            uptime = None
+
+    return {
+        "alive": alive,
+        "reason": None if alive else f"no beat for {int(beat_age)}s",
+        "pid": hb.get("pid"),
+        "beat_age_s": int(beat_age),
+        "feed_ok": hb.get("feed_ok"),
+        "feed_down_for_s": down_for,
+        "uptime_s": uptime,
+    }
+
+
 def live_state(cfg):
     """Current state and when it began, for an in-progress sleep banner."""
-    rows = read_log(cfg)
+    mon = monitor_status(cfg)
+    frame = frame_status(cfg)
+    rows = read_log(cfg, tail_bytes=int(cfg.get("api_log_tail_bytes") or 0))
     if not rows:
         return {"state": "unknown", "since": None, "elapsed_s": 0,
-                "last_sample": None, "stale": True}
+                "last_sample": None, "stale": True, "stale_for_s": 0,
+                "monitor": mon, "frame": frame}
     sessions, _gaps = sessionize(rows, float(cfg["sample_seconds"]))
     last = sessions[-1] if sessions else None
     age = (datetime.now() - rows[-1][0]).total_seconds()
@@ -1558,6 +1810,13 @@ def live_state(cfg):
         # rather than letting a client believe a four-hour-old state is current.
         "stale": age > 4 * float(cfg["sample_seconds"]),
         "stale_for_s": int(age) if age > 4 * float(cfg["sample_seconds"]) else 0,
+        # `stale` says the reading is old; these say why. A client showing a
+        # sleep banner needs the difference between "the camera is unplugged"
+        # (monitor.alive true, feed_ok false) and "nothing has been watching"
+        # (monitor.alive false) -- they are the same staleness and completely
+        # different sentences.
+        "monitor": mon,
+        "frame": frame,
     }
 
 
@@ -1575,6 +1834,23 @@ def make_handler(cfg, token):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_jpeg(self, body, frame):
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(body)))
+            # Not optional. Clients cache-bust with ?t=<n> counting from 0, so
+            # a remount repeats ?t=0 and a cached response would pin the panel
+            # to whatever frame was current the first time it mounted.
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # For curl and the collector. Scripts cannot read these off an
+            # <img> load, so the authoritative path for a UI is /v1/state.
+            self.send_header("X-Frame-Timestamp", frame["ts"] or "")
+            self.send_header("X-Frame-Age-S", str(frame["age_s"]))
             self.end_headers()
             self.wfile.write(body)
 
@@ -1616,6 +1892,33 @@ def make_handler(cfg, token):
 
             if path == "/v1/state":
                 return self._send(200, live_state(cfg))
+
+            if path in ("/v1/frame.jpg", "/v1/frame"):
+                frame = frame_status(cfg)
+                if not frame["path"]:
+                    return self._send(404, {"error": "latest_frame is not configured"})
+                if frame["ts"] is None:
+                    return self._send(503, {
+                        "error": "no frame yet",
+                        "hint": "watch has not produced a sample",
+                    })
+                if not frame["available"]:
+                    # Deliberately refuse rather than serve a stale picture as
+                    # if it were current. A client should show its own
+                    # no-signal state; a months-old frame with a fresh-looking
+                    # panel around it is worse than an empty one.
+                    return self._send(503, {
+                        "error": "frame too old",
+                        "age_s": frame["age_s"],
+                        "max_age_s": int(cfg.get("frame_max_age_s") or 0),
+                        "ts": frame["ts"],
+                    })
+                try:
+                    with open(os.path.join(HERE, frame["path"]), "rb") as fh:
+                        body = fh.read()
+                except OSError as exc:
+                    return self._send(503, {"error": f"frame unreadable: {exc}"})
+                return self._send_jpeg(body, frame)
 
             if path == "/v1/events":
                 since = None
@@ -2017,8 +2320,17 @@ def cmd_watch(cfg, args):
     archive = FrameArchive(cfg)
     if archive.enabled:
         print(f"Archiving every sample to {cfg['archive_dir']}/ "
-              f"(~39MB/hour, hard cap {archive.cap_mb:.0f}MB, "
+              f"(~39MB/hour, ring buffer at {archive.cap_mb:.0f}MB, "
               f"{archive.used_mb:.0f}MB already there).")
+
+    # One current frame at a fixed path, and proof this process is alive.
+    # Both are independent of the archive so that turning archiving off, or
+    # the ring pruning, cannot take the dashboard's picture with it.
+    latest = LatestFrame(cfg)
+    beat = Heartbeat(cfg)
+    if latest.path:
+        print(f"Latest frame -> {os.path.relpath(latest.path, HERE)} "
+              f"(rewritten atomically every sample).")
 
     # Presence turns "still" into "asleep" or "away". Without references the
     # machine falls back to motion only, which reports an empty pen as sleep:
@@ -2034,6 +2346,10 @@ def cmd_watch(cfg, args):
 
     exit_after = 60.0 * float(getattr(args, "exit_after_feed_down", 0) or 0)
     cam = open_camera_waiting(cfg, exit_after=exit_after)
+    # Beat once before the first sample. Otherwise a reader that polls in the
+    # first ~10s sees no heartbeat and reports the monitor dead while it is in
+    # fact starting up normally.
+    beat.beat(feed_ok=True)
     machine = SleepState(cfg)
     prev = None
     next_at = time.monotonic()
@@ -2071,6 +2387,11 @@ def cmd_watch(cfg, args):
                               f"exiting loudly beats spinning quietly.")
                         raise SystemExit(3)
                 prev = None
+                # Beat on the way out of the feed-down branch. This is the whole
+                # reason the heartbeat exists: this path writes no CSV row, so
+                # without a beat here "camera unplugged" and "monitor dead" are
+                # indistinguishable to anything reading the log.
+                beat.beat(feed_ok=False)
                 continue
 
             if feed_down_since is not None:
@@ -2090,6 +2411,8 @@ def cmd_watch(cfg, args):
 
             state, tag, changed = machine.update(score, corr, pres)
             archive.save(raw, score)
+            latest.save(raw)
+            beat.beat(feed_ok=True, last_sample_at=datetime.now(), state=state)
 
             if time.monotonic() >= next_snap:
                 record("periodic", score, raw)

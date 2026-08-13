@@ -50,8 +50,33 @@ Base URL is the Pi's tailnet address, e.g. `http://100.x.y.z:8787`.
 | GET | `/health` | none | `{"ok":true}` and nothing else |
 | GET | `/v1/state` | bearer | current state, for the live sleep banner |
 | GET | `/v1/events?since=&min_minutes=&merge_minutes=` | bearer | completed sleep sessions |
+| GET | `/v1/frame.jpg` | bearer | the current camera still, `image/jpeg` |
 
 Anything other than GET returns 405. There is no write path at all.
+
+### `/v1/frame.jpg`
+
+The frame `watch` last sampled, written atomically to a fixed path so a reader
+never catches a half-written jpeg. It is the clean frame -- the green ROI
+rectangle drawn on `snapshots/` is a debugging aid and does not appear here.
+
+Served `no-store`. That is not tuning: browser clients cache-bust with a
+counter starting at zero, so a remount repeats the same URL and a cached
+response would pin the image to whatever was current the first time.
+
+`503` in two cases, both deliberate: no frame has been produced yet, or the
+newest frame is older than `frame_max_age_s` (default 3600). Serving last
+night's picture behind a fresh-looking panel is worse than serving nothing.
+
+`X-Frame-Timestamp` and `X-Frame-Age-S` are on the response for `curl` and for
+service-to-service callers. **A browser cannot read them** -- headers of an
+`<img>` load are not exposed to JavaScript -- so a UI must take freshness from
+`/v1/state` instead, and gate whether it sets `src` at all on what that says.
+
+An `<img>` also cannot send an `Authorization` header. A browser-facing
+consumer therefore needs a same-origin proxy that holds the bearer token
+server-side; do not weaken the auth on this route to work around it. It is the
+most sensitive thing this program produces.
 
 `/health` is deliberately unauthenticated and deliberately empty: it proves the
 process is alive and reveals nothing about a dog, a home, or a version number
@@ -127,6 +152,34 @@ about transport:
 | --- | --- | --- |
 | `api_min_session_minutes` | 10 | shorter stretches of stillness are not reported as sleep |
 | `api_merge_stirs_minutes` | 10 | an awake span shorter than this merges the sleeps on either side into one, counted in `stirs` |
+| `frame_max_age_s` | 3600 | past this `/v1/frame.jpg` returns 503 rather than serving a stale picture as current |
+| `api_log_tail_bytes` | 131072 | `/v1/state` parses only the tail of the log; `/v1/events` still reads it whole |
+
+### Liveness: `stale` says the reading is old, `monitor` says why
+
+`/v1/state` carries two extra objects. They exist because the server reads CSVs
+off disk and has no idea whether anything is producing them, and because the
+feed-down path writes **no log row at all** -- so "the camera is unplugged" and
+"nothing has been watching" produce an identical-looking staleness.
+
+```json
+"monitor": { "alive": true, "pid": 7415, "beat_age_s": 3,
+             "feed_ok": false, "feed_down_for_s": 1840, "uptime_s": 5121 },
+"frame":   { "available": false, "ts": "2026-08-13T10:12:44", "age_s": 14987 }
+```
+
+Read them together:
+
+| `monitor.alive` | `monitor.feed_ok` | means | say |
+| --- | --- | --- | --- |
+| true | true | everything working | live |
+| true | false | monitor up, **camera** down | camera offline |
+| false | — | **monitor** dead or wedged | not being watched |
+
+`alive` comes from a heartbeat file rewritten on every loop iteration including
+the feed-down branch, with three sample intervals of slack. A client that shows
+a sleep banner without checking it will cheerfully report "asleep for 6 hours"
+when nothing has been running for 6 hours.
 
 So a night reads as one 7h04m sleep with 5 stirs, not six separate sleep events.
 A data gap always breaks a merge, since sleep across an unobserved stretch is an
