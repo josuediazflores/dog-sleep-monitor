@@ -753,20 +753,7 @@ def cmd_label(cfg, args):
     if not os.path.exists(log_path):
         raise SystemExit(f"No log at {log_path}. Run `watch` first.")
 
-    def parse(text):
-        try:
-            return datetime.fromisoformat(text)
-        except ValueError:
-            pass
-        for fmt in ("%H:%M:%S", "%H:%M"):
-            try:
-                t = datetime.strptime(text, fmt).time()
-                return datetime.combine(datetime.now().date(), t)
-            except ValueError:
-                continue
-        raise SystemExit(f"Cannot parse time {text!r}. Use HH:MM, HH:MM:SS, or ISO.")
-
-    start, end = parse(args.start), parse(args.end)
+    start, end = parse_when(args.start), parse_when(args.end)
     if end <= start:
         raise SystemExit("--to must be after --from.")
 
@@ -905,6 +892,34 @@ def cmd_tune(cfg, args):
 # --- report ------------------------------------------------------------------
 
 MARKERS_PATH = os.path.join(HERE, "markers.csv")
+
+
+def parse_when(text, now=None):
+    """Parse HH:MM, HH:MM:SS or ISO into a datetime, assuming the recent past.
+
+    A bare clock time resolves to whichever of today or yesterday is already
+    behind us. That matters because this tool exists to describe nights: at
+    00:14, `--from 23:11` means 71 minutes ago, not 23 hours from now. Naively
+    combining with today's date silently returns an empty window, which reads
+    as "no data" rather than as a mistake.
+    """
+    if not text:
+        return None
+    now = now or datetime.now()
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        pass
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            t = datetime.strptime(text, fmt).time()
+        except ValueError:
+            continue
+        when = datetime.combine(now.date(), t)
+        if when > now:
+            when -= timedelta(days=1)
+        return when
+    raise SystemExit(f"Cannot parse time {text!r}. Use HH:MM, HH:MM:SS, or ISO.")
 
 
 def read_markers():
@@ -1074,22 +1089,8 @@ def timeline_bar(sessions, gaps, width=64):
 
 
 def cmd_report(cfg, args):
-    def parse(text):
-        if not text:
-            return None
-        try:
-            return datetime.fromisoformat(text)
-        except ValueError:
-            for fmt in ("%H:%M:%S", "%H:%M"):
-                try:
-                    t = datetime.strptime(text, fmt).time()
-                    return datetime.combine(datetime.now().date(), t)
-                except ValueError:
-                    continue
-        raise SystemExit(f"Cannot parse time {text!r}.")
-
     interval = float(cfg["sample_seconds"])
-    rows = read_log(cfg, parse(args.start), parse(args.end))
+    rows = read_log(cfg, parse_when(args.start), parse_when(args.end))
     if not rows:
         raise SystemExit("No samples in that window.")
     sessions, gaps = sessionize(rows, interval)
