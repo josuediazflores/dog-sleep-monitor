@@ -106,9 +106,10 @@ DEFAULTS = {
     "scene_change_score": 0.60,      # a scene change needs BOTH a score above
     "scene_corr_max": 0.50,
     "presence_samples_to_flip": 2,   # hysteresis on occupied/empty
-    "presence_threshold": 0.030,     # vs empty-pen references: above = a dog is
-                                     # there. Measured empty 0.0000, sleeping
-                                     # dog 0.12, so this sits in a wide gap.          # this AND correlation below this, so a dog
+    "presence_threshold": 0.050,     # largest contiguous change vs the closest
+                                     # empty-pen reference. Measured: empty
+                                     # 0.014-0.033 even after scene drift,
+                                     # occupied 0.071-0.106.          # this AND correlation below this, so a dog
                                      # filling the frame is not mistaken for the
                                      # day/night IR switch
 
@@ -1662,11 +1663,21 @@ def load_references(cfg):
 
 
 def presence_score(frame_prepared, references, pixel_threshold):
-    """How unlike *every* known empty pen this frame is, in [0, 1].
+    """Size of the largest contiguous change against the closest empty-pen
+    reference, as a fraction of the ROI, in [0, 1].
 
     The minimum across references, not the mean. An empty pen only has to match
     one stored condition to be recognised, which is what makes a growing
     reference set robust: day, night-with-IR, blanket-moved, all coexist.
+
+    Largest *blob* rather than total fraction changed, because the pen is full
+    of movable objects. Toys and the blanket shift over a morning, so an empty
+    pen drifts from its reference by an ever-growing fraction of scattered
+    pixels: measured 0.015 against a 5-minute-old reference and 0.071 against a
+    45-minute-old one, which crossed the threshold and reported a dog in an
+    empty pen. Those changes are scattered; a dog is one contiguous mass. The
+    largest blob barely moved over the same drift (0.014 -> 0.033) while an
+    occupied pen sat at 0.071-0.106.
 
     Returns (score, which_reference_matched).
     """
@@ -1674,9 +1685,13 @@ def presence_score(frame_prepared, references, pixel_threshold):
         return None, None
     best, which = 1.0, None
     for name, ref in references:
-        d = float((np.abs(ref - frame_prepared) > pixel_threshold).mean())
-        if d < best:
-            best, which = d, name
+        diff = (np.abs(ref - frame_prepared) > pixel_threshold).astype(np.uint8)
+        count, _labels, stats, _c = cv2.connectedComponentsWithStats(
+            diff, connectivity=8)
+        blob = max((stats[i, cv2.CC_STAT_AREA] for i in range(1, count)),
+                   default=0) / float(diff.size)
+        if blob < best:
+            best, which = blob, name
     return best, which
 
 
