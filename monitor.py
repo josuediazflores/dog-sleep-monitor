@@ -478,10 +478,14 @@ def dir_size_mb(path):
 
 
 class FrameArchive:
-    """Writes one jpeg per sample for offline review, under a hard size cap.
+    """Writes one jpeg per sample for offline review, as a rolling window.
 
-    Meant to be temporary: capture a session, have something review it, then
-    `purge`. The cap exists because 720 frames an hour fills a disk quietly.
+    The cap exists because 720 frames an hour fills a disk quietly. It used to
+    be a hard stop: on reaching the cap this set `stopped` and never wrote
+    again, which is a bad failure because monitoring carried on looking healthy
+    while the thing you would review after the fact silently ended. It is now a
+    ring buffer -- oldest frames are dropped to make room -- so the archive is
+    always the most recent N hours and never needs manual attention.
     """
 
     def __init__(self, cfg):
@@ -496,6 +500,31 @@ class FrameArchive:
             os.makedirs(self.dir, exist_ok=True)
             self.used_mb = dir_size_mb(self.dir)
 
+    def prune_to(self, target_mb):
+        """Drop oldest frames until under target_mb. Returns MB freed.
+
+        Filenames are `TIMESTAMP_score.jpg` with a zero-padded ISO timestamp,
+        so lexical order is chronological -- sorting the names is enough and no
+        stat() per file is needed to find the oldest.
+        """
+        try:
+            names = sorted(n for n in os.listdir(self.dir) if n.endswith(".jpg"))
+        except OSError:
+            return 0.0
+        freed = 0.0
+        for name in names:
+            if self.used_mb - freed <= target_mb:
+                break
+            path = os.path.join(self.dir, name)
+            try:
+                size = os.path.getsize(path)
+                os.remove(path)
+                freed += size / (1024.0 * 1024.0)
+            except OSError:
+                continue
+        self.used_mb -= freed
+        return freed
+
     def save(self, frame, score):
         if not self.enabled or self.stopped:
             return None
@@ -504,10 +533,18 @@ class FrameArchive:
         if self.written % 200 == 0:
             self.used_mb = dir_size_mb(self.dir)
         if self.used_mb >= self.cap_mb:
-            self.stopped = True
-            print(f"{stamp()}  ARCHIVE FULL at {self.used_mb:.0f}MB "
-                  f"(cap {self.cap_mb:.0f}MB). Archiving off; monitoring continues.")
-            return None
+            # Prune to 90% rather than to exactly the cap, so this runs once in
+            # a while instead of on every single save once the cap is reached.
+            target = self.cap_mb * 0.9
+            freed = self.prune_to(target)
+            if freed <= 0:
+                self.stopped = True
+                print(f"{stamp()}  ARCHIVE FULL at {self.used_mb:.0f}MB "
+                      f"(cap {self.cap_mb:.0f}MB) and nothing could be pruned. "
+                      f"Archiving off; monitoring continues.")
+                return None
+            print(f"{stamp()}  archive at cap, pruned {freed:.0f}MB of oldest "
+                  f"frames; now {self.used_mb:.0f}MB of {self.cap_mb:.0f}MB")
 
         img = frame if self.scale >= 0.999 else cv2.resize(
             frame, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
