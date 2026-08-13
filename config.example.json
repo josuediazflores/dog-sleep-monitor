@@ -55,5 +55,6 @@
   "api_token_env": "MONITOR_API_TOKEN",
   "api_min_session_minutes": 10,
   "api_merge_stirs_minutes": 10,
-  "presence_threshold": 0.03
+  "presence_threshold": 0.03,
+  "presence_samples_to_flip": 2
 }

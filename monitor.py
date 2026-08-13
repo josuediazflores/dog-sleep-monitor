@@ -97,6 +97,7 @@ DEFAULTS = {
     "active_score": 0.030,           # above this, it counts as movement
     "scene_change_score": 0.60,      # a scene change needs BOTH a score above
     "scene_corr_max": 0.50,
+    "presence_samples_to_flip": 2,   # hysteresis on occupied/empty
     "presence_threshold": 0.030,     # vs empty-pen references: above = a dog is
                                      # there. Measured empty 0.0000, sleeping
                                      # dog 0.12, so this sits in a wide gap.          # this AND correlation below this, so a dog
@@ -622,17 +623,59 @@ class SleepState:
         self.active_score = float(cfg["active_score"])
         self.scene_score = float(cfg["scene_change_score"])
         self.scene_corr_max = float(cfg["scene_corr_max"])
+        self.presence_threshold = float(cfg["presence_threshold"])
+        self.presence_needed = int(cfg["presence_samples_to_flip"])
         self.state = state
         self.quiet_run = 0
         self.active_run = 0
+        self.presence = "unknown"
+        self.occupied_run = 0
+        self.empty_run = 0
 
-    def update(self, score, corr=1.0):
+    def _update_presence(self, presence, score):
+        """Track occupied/empty with its own hysteresis.
+
+        The interlock is that flipping to *empty* requires the frame to be both
+        unlike a dog AND still. A stale reference plus a person walking through
+        would otherwise read as "the dog left", which is the one presence error
+        that silently deletes real activity from the record.
+        """
+        if presence > self.presence_threshold:
+            self.occupied_run += 1
+            self.empty_run = 0
+        elif score < self.active_score:
+            self.empty_run += 1
+            self.occupied_run = 0
+        else:
+            # Looks empty but something is moving. Trust neither; hold.
+            return "contradiction"
+
+        if self.occupied_run >= self.presence_needed:
+            self.presence = "occupied"
+        elif self.empty_run >= self.presence_needed:
+            if self.presence != "empty":
+                # A pen that just emptied must not carry a quiet run into
+                # "away", nor hand one back to the dog when she returns.
+                self.quiet_run = self.active_run = 0
+            self.presence = "empty"
+        return None
+
+    def update(self, score, corr=1.0, presence=None):
         """Returns (state, tag, changed).
 
-        corr defaults to 1.0, meaning "structurally the same scene". Replays of
-        logged scores use that default, which is correct because scene-change
-        rows are excluded from labeled data anyway.
+        corr defaults to 1.0, meaning "structurally the same scene". presence
+        defaults to None, meaning "unknown", which keeps replays of logged
+        scores behaving exactly as the two-state machine did.
         """
+        if presence is not None:
+            note = self._update_presence(presence, score)
+            if note == "contradiction":
+                return self.state, "empty+motion", False
+            if self.presence == "empty":
+                changed = self.state != "away"
+                self.state = "away"
+                return self.state, "away", changed
+
         if score > self.scene_score and corr < self.scene_corr_max:
             # Both conditions required. A big change that stays correlated is a
             # dog filling the frame, not the room re-lighting; treating that as
@@ -656,6 +699,11 @@ class SleepState:
             self.state, changed = "asleep", True
         elif self.state != "awake" and self.active_run >= self.active_needed:
             self.state, changed = "awake", True
+        elif self.state == "away":
+            # Presence has returned but neither motion run is conclusive yet.
+            # "away" is no longer true, and asserting either other state would
+            # be a guess, so say so.
+            self.state, changed = "unknown", True
         return self.state, tag, changed
 
 
