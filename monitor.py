@@ -1958,6 +1958,7 @@ def cmd_watch(cfg, args):
               f"(~39MB/hour, hard cap {archive.cap_mb:.0f}MB, "
               f"{archive.used_mb:.0f}MB already there).")
 
+    exit_after = 60.0 * float(getattr(args, "exit_after_feed_down", 0) or 0)
     cam = open_camera_waiting(cfg, exit_after=exit_after)
     machine = SleepState(cfg)
     prev = None
@@ -1966,7 +1967,6 @@ def cmd_watch(cfg, args):
     limit = int(getattr(args, "samples", 0) or 0)
     feed_down_since = None
     last_feed_note = 0.0
-    exit_after = 60.0 * float(getattr(args, "exit_after_feed_down", 0) or 0)
 
     try:
         while limit == 0 or taken < limit:
