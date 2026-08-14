@@ -105,6 +105,16 @@ DEFAULTS = {
     "active_score": 0.030,           # above this, it counts as movement
     "scene_change_score": 0.60,      # a scene change needs BOTH a score above
     "scene_corr_max": 0.50,
+    # --- shadow scoring: measure candidate settings on live frames ---
+    # null disables. Set shadow_pixel_threshold to evaluate a candidate without
+    # letting it near the state machine; results land in shadow_log.csv and
+    # nothing reads them but you.
+    "shadow_pixel_threshold": None,
+    "shadow_blur_kernel": None,
+    "shadow_work_size": None,
+    "shadow_until": None,            # ISO timestamp; stops on its own after it
+    "shadow_log": "shadow_log.csv",
+
     "presence_pixel_threshold": 0.30,  # deliberately NOT pixel_threshold.
                                      # Motion compares two frames seconds
                                      # apart, so it wants a low threshold to
@@ -675,6 +685,77 @@ class LatestFrame:
             return False
         data = buf.tobytes()
         return _write_atomic(self.path, lambda tmp: _put_bytes(tmp, data))
+
+
+class ShadowScorer:
+    """Scores every sample a second time at candidate settings, and logs it.
+
+    Exists because the archive turned out to be an unfaithful substrate for
+    exactly the question it was asked. Archived frames are half scale and JPEG
+    quality 80, and that compression is what was suppressing the sensor noise.
+    At pixel_threshold 0.30 with an aggressive downscale that made no
+    difference -- recomputed scores reproduced the live ones to r = 1.0000 --
+    but at 0.05 with a larger work_size the smoothing is the whole story, and
+    the archive under-reported live scores by roughly ten times. A sweep over
+    it recommended thresholds that classified a sleeping dog as awake in every
+    one of the first 43 samples.
+
+    So candidate settings have to be measured on the frames the camera
+    actually delivers. This does that inline: same frames, same moment, no
+    second RTSP session, no images kept. It never touches the state machine --
+    the number is written to its own log and acted on by nobody, so a bad
+    candidate costs a column in a CSV instead of a night of wrong states.
+    """
+
+    def __init__(self, cfg):
+        pt = cfg.get("shadow_pixel_threshold")
+        self.enabled = pt is not None
+        if not self.enabled:
+            return
+        # A full config, so prepare() behaves exactly as it would in a real run.
+        self.cfg = dict(cfg)
+        self.cfg["pixel_threshold"] = float(pt)
+        for src, dst in (("shadow_blur_kernel", "blur_kernel"),
+                         ("shadow_work_size", "work_size")):
+            if cfg.get(src) is not None:
+                self.cfg[dst] = cfg[src]
+        self.until = None
+        if cfg.get("shadow_until"):
+            try:
+                self.until = datetime.fromisoformat(cfg["shadow_until"])
+            except ValueError:
+                self.until = None
+        self.path = os.path.join(HERE, cfg.get("shadow_log") or "shadow_log.csv")
+        self.prev = None
+        new = not os.path.exists(self.path)
+        self.fh = open(self.path, "a", newline="")
+        self.w = csv.writer(self.fh)
+        if new:
+            self.w.writerow(["timestamp", "live_score", "shadow_score", "state"])
+            self.fh.flush()
+
+    def expired(self):
+        return self.until is not None and datetime.now() >= self.until
+
+    def sample(self, raw, live_score, state):
+        """Score this frame pair at the candidate settings and log it."""
+        if not self.enabled or self.expired():
+            return None
+        cur = prepare(raw, self.cfg)
+        prev, self.prev = self.prev, cur
+        if prev is None:
+            return None
+        s = motion_score(prev, cur, self.cfg["pixel_threshold"])
+        self.w.writerow([stamp(), f"{live_score:.6f}", f"{s:.6f}", state])
+        self.fh.flush()
+        return s
+
+    def close(self):
+        if self.enabled:
+            try:
+                self.fh.close()
+            except OSError:
+                pass
 
 
 class Heartbeat:
@@ -2483,6 +2564,14 @@ def cmd_watch(cfg, args):
         events.flush()
         return path
 
+    shadow = ShadowScorer(cfg)
+    if shadow.enabled:
+        print(f"Shadow-scoring at pixel_threshold={shadow.cfg['pixel_threshold']}, "
+              f"blur={shadow.cfg['blur_kernel']}, work_size={shadow.cfg['work_size']} "
+              f"-> {os.path.basename(shadow.path)}"
+              + (f" until {shadow.until:%Y-%m-%d %H:%M}" if shadow.until else ""))
+        print("  (logged only; it does not affect the state machine)")
+
     archive = FrameArchive(cfg)
     if archive.enabled:
         print(f"Archiving every sample to {cfg['archive_dir']}/ "
@@ -2577,6 +2666,7 @@ def cmd_watch(cfg, args):
             prev = cur
 
             state, tag, changed = machine.update(score, corr, pres)
+            shadow.sample(raw, score, state)
             archive.save(raw, score)
             latest.save(raw)
             beat.beat(feed_ok=True, last_sample_at=datetime.now(), state=state)
