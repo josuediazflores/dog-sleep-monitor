@@ -591,6 +591,13 @@ class FrameArchive:
         return path
 
 
+def _put_bytes(path, data):
+    """Write bytes and close the handle, so os.replace never races a buffer
+    that is still open."""
+    with open(path, "wb") as fh:
+        fh.write(data)
+
+
 def _write_atomic(path, write_bytes):
     """Write via a temp file in the same directory, then os.replace().
 
@@ -605,7 +612,13 @@ def _write_atomic(path, write_bytes):
         write_bytes(tmp)
         os.replace(tmp, path)
         return True
-    except OSError:
+    except Exception:
+        # Deliberately not just OSError. Everything written through here is a
+        # convenience for readers -- the latest frame, the heartbeat -- and the
+        # capture loop and its CSV are the actual product. Letting an encoder
+        # or serialisation error escape kills capture to protect a thumbnail,
+        # which is exactly backwards. A False return degrades one file; an
+        # exception here degrades the whole monitor.
         try:
             os.remove(tmp)
         except OSError:
@@ -638,10 +651,17 @@ class LatestFrame:
             return False
         img = frame if self.scale >= 0.999 else cv2.resize(
             frame, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
-        return _write_atomic(
-            self.path,
-            lambda tmp: cv2.imwrite(tmp, img, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]),
-        )
+        # imencode, not imwrite. imwrite picks its encoder from the *filename's*
+        # extension, and the atomic write hands it "latest.jpg.tmp" -- there is
+        # no writer for ".tmp", so it raised on the first frame every time.
+        # Encoding to bytes here states the format outright and leaves the temp
+        # file a plain byte dump, so the two concerns stop being coupled.
+        ok, buf = cv2.imencode(
+            ".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
+        if not ok:
+            return False
+        data = buf.tobytes()
+        return _write_atomic(self.path, lambda tmp: _put_bytes(tmp, data))
 
 
 class Heartbeat:
@@ -685,7 +705,7 @@ class Heartbeat:
         }
         _write_atomic(
             self.path,
-            lambda tmp: open(tmp, "w").write(json.dumps(payload)),
+            lambda tmp: _put_bytes(tmp, json.dumps(payload).encode()),
         )
 
 
