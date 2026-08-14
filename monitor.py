@@ -105,6 +105,19 @@ DEFAULTS = {
     "active_score": 0.030,           # above this, it counts as movement
     "scene_change_score": 0.60,      # a scene change needs BOTH a score above
     "scene_corr_max": 0.50,
+    "presence_pixel_threshold": 0.30,  # deliberately NOT pixel_threshold.
+                                     # Motion compares two frames seconds
+                                     # apart, so it wants a low threshold to
+                                     # catch small movement. Presence compares
+                                     # against a reference hours or days old,
+                                     # where lighting drift and settling make
+                                     # a low threshold flag the whole frame as
+                                     # changed. Measured on the empty-pen
+                                     # window: at 0.30 empty tops out at 0.088
+                                     # and occupied bottoms at 0.709, an 8x
+                                     # margin; at 0.05 the two close to
+                                     # 0.84 vs 0.95 and away stops being
+                                     # separable in practice.
     "presence_samples_to_flip": 2,   # hysteresis on occupied/empty
     "presence_threshold": 0.050,     # largest contiguous change vs the closest
                                      # empty-pen reference. Measured: empty
@@ -2168,7 +2181,7 @@ def cmd_reference(cfg, args):
     ir = frame_is_ir(raw)
     print(f"  Lighting: {'INFRARED (night mode)' if ir else 'COLOUR (daylight)'}")
 
-    score, which = presence_score(prepared, refs, cfg["pixel_threshold"])
+    score, which = presence_score(prepared, refs, cfg["presence_pixel_threshold"])
     if score is not None:
         print(f"  Against {len(refs)} existing reference(s): closest is "
               f"{which} at {score:.4f}")
@@ -2236,7 +2249,7 @@ def cmd_presence(cfg, args):
             cam.close()
     prepared = prepare(raw, cfg)
     print(f"  Lighting: {'INFRARED (night mode)' if frame_is_ir(raw) else 'COLOUR (daylight)'}")
-    score, which = presence_score(prepared, refs, cfg["pixel_threshold"])
+    score, which = presence_score(prepared, refs, cfg["presence_pixel_threshold"])
     verdict = "OCCUPIED" if score > cfg["presence_threshold"] else "EMPTY"
     print(f"  presence score {score:.4f}  (threshold "
           f"{cfg['presence_threshold']})  -> {verdict}")
@@ -2560,7 +2573,7 @@ def cmd_watch(cfg, args):
 
             score = motion_score(prev, cur, cfg["pixel_threshold"])
             corr = correlation(prev, cur)
-            pres, _ref = presence_score(cur, references, cfg["pixel_threshold"])
+            pres, _ref = presence_score(cur, references, cfg["presence_pixel_threshold"])
             prev = cur
 
             state, tag, changed = machine.update(score, corr, pres)
