@@ -14,6 +14,7 @@ Subcommands:
 """
 
 import argparse
+import collections
 import csv
 import hmac
 import json
@@ -690,15 +691,22 @@ class LatestFrame:
 class ShadowScorer:
     """Scores every sample a second time at candidate settings, and logs it.
 
-    Exists because the archive turned out to be an unfaithful substrate for
-    exactly the question it was asked. Archived frames are half scale and JPEG
-    quality 80, and that compression is what was suppressing the sensor noise.
-    At pixel_threshold 0.30 with an aggressive downscale that made no
-    difference -- recomputed scores reproduced the live ones to r = 1.0000 --
-    but at 0.05 with a larger work_size the smoothing is the whole story, and
-    the archive under-reported live scores by roughly ten times. A sweep over
-    it recommended thresholds that classified a sleeping dog as awake in every
-    one of the first 43 samples.
+    Exists because the archive can only be trusted for the config that
+    produced it. Archived frames are half scale and JPEG quality 80. At the
+    config in force that made no measurable difference -- recomputed scores
+    reproduced the live ones at r = 1.0000 over 444 pairs, with all 241
+    zero-score frames recomputing to zero. That validation is real, but it
+    covers only pixel_threshold 0.30 at a 64x48 work_size, where the downscale
+    discards the same fine detail the compression does.
+
+    A candidate that looks harder at fine detail is a different matter: the
+    compression that was irrelevant at 0.30 sits exactly where a 0.05
+    threshold does its work. In the ten minutes that candidate ran live it
+    produced 105 samples at a median score of 0.068, 94 of them classified
+    awake and none asleep, against an offline prediction of 0.085 median on
+    active samples and 0.009 on quiet ones. Those are not comparable -- the
+    live window carries no labels and she may simply have been active -- and
+    that is the point. There was no way to tell.
 
     So candidate settings have to be measured on the frames the camera
     actually delivers. This does that inline: same frames, same moment, no
@@ -2308,6 +2316,102 @@ def cmd_reference(cfg, args):
               "  an empty pen does not move, it reads as asleep.")
 
 
+def cmd_daily(cfg, args):
+    """Per-day totals over a window of the clock, default 08:00-20:00.
+
+    Reported as a share of the time actually observed, not of the window.
+    The monitor is not always up -- restarts, feed outages, a camera left
+    unplugged -- and a day with four hours of coverage would otherwise look
+    like a day with four hours of sleep. Coverage is printed alongside every
+    row so a low number is visible as a low number rather than read as a
+    finding, and any day below --min-coverage is marked rather than silently
+    averaged in.
+    """
+    lo, hi = args.start, args.end
+    rows = read_log(cfg)
+    if not rows:
+        raise SystemExit("No log yet.")
+
+    per = {}
+    # read_log yields (when, score, state, changed) tuples, and rewrites state
+    # to "empty" inside hand-marked pen-empty windows -- which is exactly the
+    # time that must not count as stillness, so it is folded in with "away".
+    for when, _score, state, _changed in rows:
+        if not (lo <= when.hour < hi):
+            continue
+        if state == "empty":
+            state = "away"
+        per.setdefault(when.date(), collections.Counter())[state] += 1
+
+    if not per:
+        raise SystemExit(f"No samples between {lo:02d}:00 and {hi:02d}:00.")
+
+    sec = float(cfg["sample_seconds"])
+    window_s = (hi - lo) * 3600.0
+    out = []
+    for day in sorted(per):
+        c = per[day]
+        n = sum(c.values())
+        covered = n * sec
+        still = c["asleep"] * sec
+        out.append({
+            "date": day,
+            "still_s": still,
+            "awake_s": c["awake"] * sec,
+            "away_s": c["away"] * sec,
+            "unknown_s": c["unknown"] * sec,
+            "covered_s": covered,
+            "coverage": covered / window_s,
+            # Extrapolated to the full window, which is only honest to quote
+            # when coverage is high -- hence the flag rather than a bare number.
+            "still_est_s": (still / covered) * window_s if covered else 0.0,
+        })
+
+    if args.csv:
+        path = os.path.join(HERE, args.csv)
+        with open(path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["date", "window", "still_h", "awake_h", "away_h",
+                        "covered_h", "coverage_pct", "still_pct_of_covered",
+                        "still_est_h", "low_coverage"])
+            for r in out:
+                w.writerow([r["date"], f"{lo:02d}:00-{hi:02d}:00",
+                            f"{r['still_s']/3600:.2f}", f"{r['awake_s']/3600:.2f}",
+                            f"{r['away_s']/3600:.2f}", f"{r['covered_s']/3600:.2f}",
+                            f"{100*r['coverage']:.0f}",
+                            f"{100*r['still_s']/r['covered_s']:.1f}" if r["covered_s"] else "",
+                            f"{r['still_est_s']/3600:.2f}",
+                            "yes" if r["coverage"] < args.min_coverage else ""])
+        print(f"  Wrote {os.path.relpath(path, HERE)}")
+
+    print(f"\n  Daytime stillness, {lo:02d}:00-{hi:02d}:00 "
+          f"({hi - lo}h window)\n")
+    print(f"  {'date':<12} {'still':>8} {'awake':>8} {'away':>8} "
+          f"{'covered':>9} {'still %':>8}  est. full window")
+    print("  " + "-" * 74)
+    good = []
+    for r in out:
+        pct = 100 * r["still_s"] / r["covered_s"] if r["covered_s"] else 0.0
+        low = r["coverage"] < args.min_coverage
+        est = f"{r['still_est_s']/3600:.1f}h"
+        print(f"  {str(r['date']):<12} {human(r['still_s']):>8} "
+              f"{human(r['awake_s']):>8} {human(r['away_s']):>8} "
+              f"{human(r['covered_s']):>9} {pct:>7.1f}%  "
+              f"{est if not low else '(' + str(round(r['coverage']*100)) + '% covered)'}")
+        if not low:
+            good.append(pct)
+    print()
+    if good:
+        avg = sum(good) / len(good)
+        print(f"  Across {len(good)} day(s) with at least "
+              f"{100*args.min_coverage:.0f}% coverage: {avg:.1f}% of observed "
+              f"daytime still, about {avg/100*(hi-lo):.1f}h of the {hi-lo}h window.")
+    skipped = len(out) - len(good)
+    if skipped:
+        print(f"  {skipped} day(s) excluded from that average for thin coverage.")
+    print("\n  Stillness, not sleep. A motionless awake dog reads as still.")
+
+
 def cmd_presence(cfg, args):
     """Check the current frame against the empty-pen references."""
     refs = load_references(cfg)
@@ -2747,6 +2851,14 @@ def main():
                    help="grab straight from the camera instead of reusing the "
                         "frame `watch` already wrote")
 
+    p = sub.add_parser("daily", help="per-day stillness over a window of the clock")
+    p.add_argument("--start", type=int, default=8, help="window start hour (default 8)")
+    p.add_argument("--end", type=int, default=20, help="window end hour (default 20)")
+    p.add_argument("--min-coverage", type=float, default=0.6,
+                   help="days observed less than this fraction of the window are "
+                        "reported but left out of the average (default 0.6)")
+    p.add_argument("--csv", help="also write the table to this file")
+
     sub.add_parser("tune", help="grid-search thresholds against labeled data")
 
     p = sub.add_parser("dataset", help="export archived frames for labeling")
@@ -2787,6 +2899,7 @@ def main():
      "mark": cmd_mark,
      "reference": cmd_reference,
      "presence": cmd_presence,
+     "daily": cmd_daily,
      "report": cmd_report,
      "serve": cmd_serve,
      "doctor": cmd_doctor}[args.cmd](cfg, args)
