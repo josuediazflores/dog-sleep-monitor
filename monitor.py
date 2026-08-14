@@ -130,6 +130,22 @@ DEFAULTS = {
                                      # 0.84 vs 0.95 and away stops being
                                      # separable in practice.
     "presence_samples_to_flip": 2,   # hysteresis on occupied/empty
+    "presence_threshold_night": 0.015,  # the same test under infrared, where
+                                     # the numbers are an order of magnitude
+                                     # smaller and a single value cannot serve
+                                     # both. Measured over one full night with
+                                     # the pen occupied throughout: presence
+                                     # bottomed out at 0.023, while an empty
+                                     # pen read 0.000. The daytime 0.05 sat
+                                     # inside the occupied range and produced
+                                     # 12 false "away" episodes totalling 50
+                                     # minutes. There is no single number that
+                                     # works: daytime empty reaches 0.046 and
+                                     # night-time occupied falls to 0.023, so
+                                     # any threshold above the first is above
+                                     # the second. A small dark dog under a
+                                     # narrow-band lamp simply changes far
+                                     # fewer pixels than a lit room does.
     "presence_threshold": 0.050,     # largest contiguous change vs the closest
                                      # empty-pen reference. Measured: empty
                                      # 0.014-0.033 even after scene drift,
@@ -981,7 +997,7 @@ class SleepState:
         self.occupied_run = 0
         self.empty_run = 0
 
-    def _update_presence(self, presence, score):
+    def _update_presence(self, presence, score, threshold=None):
         """Track occupied/empty with its own hysteresis.
 
         The interlock is that flipping to *empty* requires the frame to be both
@@ -989,7 +1005,7 @@ class SleepState:
         would otherwise read as "the dog left", which is the one presence error
         that silently deletes real activity from the record.
         """
-        if presence > self.presence_threshold:
+        if presence > (self.presence_threshold if threshold is None else threshold):
             self.occupied_run += 1
             self.empty_run = 0
         elif score < self.active_score:
@@ -1009,15 +1025,19 @@ class SleepState:
             self.presence = "empty"
         return None
 
-    def update(self, score, corr=1.0, presence=None):
+    def update(self, score, corr=1.0, presence=None, presence_threshold=None):
         """Returns (state, tag, changed).
 
         corr defaults to 1.0, meaning "structurally the same scene". presence
         defaults to None, meaning "unknown", which keeps replays of logged
         scores behaving exactly as the two-state machine did.
+
+        presence_threshold overrides the configured one for this sample, which
+        is how the infrared and daylight cutoffs stay separate without the
+        machine needing to know what a camera is.
         """
         if presence is not None:
-            note = self._update_presence(presence, score)
+            note = self._update_presence(presence, score, presence_threshold)
             if note == "contradiction":
                 return self.state, "empty+motion", False
             if self.presence == "empty":
@@ -2435,9 +2455,12 @@ def cmd_presence(cfg, args):
     prepared = prepare(raw, cfg)
     print(f"  Lighting: {'INFRARED (night mode)' if frame_is_ir(raw) else 'COLOUR (daylight)'}")
     score, which = presence_score(prepared, refs, cfg["presence_pixel_threshold"])
-    verdict = "OCCUPIED" if score > cfg["presence_threshold"] else "EMPTY"
-    print(f"  presence score {score:.4f}  (threshold "
-          f"{cfg['presence_threshold']})  -> {verdict}")
+    thr = (cfg["presence_threshold_night"] if frame_is_ir(raw)
+           else cfg["presence_threshold"])
+    verdict = "OCCUPIED" if score > thr else "EMPTY"
+    print(f"  presence score {score:.4f}  (threshold {thr}, "
+          f"{'night' if thr == cfg['presence_threshold_night'] else 'day'})"
+          f"  -> {verdict}")
     print(f"  closest reference: {which}  of {len(refs)} known")
 
 
@@ -2769,7 +2792,15 @@ def cmd_watch(cfg, args):
             pres, _ref = presence_score(cur, references, cfg["presence_pixel_threshold"])
             prev = cur
 
-            state, tag, changed = machine.update(score, corr, pres)
+            # Which cutoff applies is a property of the frame, not the clock.
+            # Keyed off the image because that is what actually changed: the
+            # camera flips its own IR lamp on its own schedule, and a clock
+            # rule would disagree with it on overcast afternoons and in the
+            # minutes either side of dusk.
+            pres_thr = (cfg["presence_threshold_night"] if frame_is_ir(raw)
+                        else cfg["presence_threshold"])
+
+            state, tag, changed = machine.update(score, corr, pres, pres_thr)
             shadow.sample(raw, score, state)
             archive.save(raw, score)
             latest.save(raw)
