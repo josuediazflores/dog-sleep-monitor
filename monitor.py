@@ -2101,12 +2101,18 @@ def frame_is_ir(raw):
     reference was taken under, and a reference filed as "night" that was
     actually shot in colour is worse than no reference at all -- it looks like
     the gap is covered when it is not.
+    Measured on this camera: daylight 7.97, a greyscale frame 0.00, greyscale
+    plus +/-2 sensor noise 1.59. The cutoff sits at 3.0 rather than midway,
+    because the two mistakes are not equally bad. Reading IR as colour only
+    costs a --force. Reading colour as IR files a daylight frame as the night
+    reference, which leaves the gap looking covered while `away` stays blind --
+    so the benefit of the doubt goes to colour.
     """
     if raw is None or raw.ndim != 3 or raw.shape[2] < 3:
         return True
     b, g, r = (raw[:, :, i].astype(np.float32) for i in range(3))
     spread = (np.abs(b - g) + np.abs(g - r) + np.abs(b - r)) / 3.0
-    return float(spread.mean()) < 4.0
+    return float(spread.mean()) < 3.0
 
 
 def _latest_frame_for_reference(cfg, max_age_s=90):
