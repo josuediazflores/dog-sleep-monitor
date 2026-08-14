@@ -2088,6 +2088,50 @@ def presence_score(frame_prepared, references, pixel_threshold):
     return best, which
 
 
+def frame_is_ir(raw):
+    """True if the frame looks like the camera's night mode.
+
+    An IR-lit frame is illuminated by a single narrow band, so the three
+    channels carry nearly the same value everywhere and the image is grey in
+    all but name. Daylight leaves real colour separation. Sampling the mean
+    absolute channel spread tells the two apart without needing anything from
+    the camera's API.
+
+    This matters because the label is the only record of which lighting a
+    reference was taken under, and a reference filed as "night" that was
+    actually shot in colour is worse than no reference at all -- it looks like
+    the gap is covered when it is not.
+    """
+    if raw is None or raw.ndim != 3 or raw.shape[2] < 3:
+        return True
+    b, g, r = (raw[:, :, i].astype(np.float32) for i in range(3))
+    spread = (np.abs(b - g) + np.abs(g - r) + np.abs(b - r)) / 3.0
+    return float(spread.mean()) < 4.0
+
+
+def _latest_frame_for_reference(cfg, max_age_s=90):
+    """The newest frame `watch` already wrote, or None.
+
+    Preferred over opening the camera whenever the monitor is running. A second
+    RTSP session competes with the capture loop on a 2.4GHz-only camera and can
+    push it past stale_after -- so grabbing a reference would itself write a
+    feed-down event and punch a hole in the night's data, which is precisely
+    the data the reference is meant to improve.
+    """
+    name = cfg.get("latest_frame") or ""
+    if not name:
+        return None
+    path = os.path.join(HERE, name)
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return None
+    if age > max_age_s:
+        return None
+    img = cv2.imread(path)
+    return None if img is None else (img, age)
+
+
 def cmd_reference(cfg, args):
     """Capture an empty-pen reference. Run this while the pen is genuinely empty.
 
@@ -2098,11 +2142,25 @@ def cmd_reference(cfg, args):
     os.makedirs(REF_DIR, exist_ok=True)
     refs = load_references(cfg)
 
-    cam = open_camera(cfg)
-    try:
-        prepared, raw = grab_sample(cam, cfg, keep_raw=True)
-    finally:
-        cam.close()
+    raw = None
+    if not args.live:
+        got = _latest_frame_for_reference(cfg)
+        if got:
+            raw, age = got
+            print(f"  Using the frame `watch` just wrote ({age:.0f}s old) -- "
+                  "no second camera session.")
+    if raw is None:
+        if not args.live:
+            print("  No recent frame from `watch`; opening the camera directly.")
+        cam = open_camera(cfg)
+        try:
+            _, raw = grab_sample(cam, cfg, keep_raw=True)
+        finally:
+            cam.close()
+    prepared = prepare(raw, cfg)
+
+    ir = frame_is_ir(raw)
+    print(f"  Lighting: {'INFRARED (night mode)' if ir else 'COLOUR (daylight)'}")
 
     score, which = presence_score(prepared, refs, cfg["pixel_threshold"])
     if score is not None:
@@ -2117,12 +2175,37 @@ def cmd_reference(cfg, args):
                 "  Use --force if you are certain the pen is empty and the scene\n"
                 "  has simply changed (furniture moved, lights changed).")
 
-    label = args.label or ("night" if (datetime.now().hour >= 20
-                                       or datetime.now().hour < 6) else "day")
+    # Labelled by what the frame actually looks like, not by the clock. The IR
+    # cut filter switches on ambient light, not on a schedule, so "after 8pm"
+    # was only ever a proxy -- and a wrong one on a bright evening or a dark
+    # afternoon.
+    label = args.label or ("night" if ir else "day")
+    if not args.force:
+        if label == "night" and not ir:
+            raise SystemExit(
+                "\n  Refusing to file this as a NIGHT reference: the frame is\n"
+                "  still in colour, so the camera has not switched to infrared.\n"
+                "  The whole point of a night reference is to capture the scene\n"
+                "  as IR renders it -- every surface changes when it engages.\n"
+                "  Wait until the room is dark enough for the camera to switch,\n"
+                "  or pass --force.")
+        if label == "day" and ir:
+            raise SystemExit(
+                "\n  Refusing to file this as a DAY reference: the frame is\n"
+                "  infrared. Pass --label night, or --force.")
+
     path = os.path.join(REF_DIR, f"{label}_{datetime.now():%Y%m%dT%H%M%S}.jpg")
     cv2.imwrite(path, raw, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     print(f"  Stored {os.path.relpath(path, HERE)}")
-    print(f"  {len(load_references(cfg))} reference(s) now known.")
+
+    now = load_references(cfg)
+    print(f"  {len(now)} reference(s) now known:")
+    for name, _ in now:
+        print(f"    {name}")
+    if not any(n.startswith("night") for n, _ in now):
+        print("\n  Still no NIGHT reference. Until there is one, `away` cannot\n"
+              "  fire in the dark: an empty pen reads as occupied, and because\n"
+              "  an empty pen does not move, it reads as asleep.")
 
 
 def cmd_presence(cfg, args):
@@ -2131,11 +2214,22 @@ def cmd_presence(cfg, args):
     if not refs:
         raise SystemExit("No references yet. Run `reference` while the pen is "
                          "empty.")
-    cam = open_camera(cfg)
-    try:
-        prepared = grab_sample(cam, cfg)
-    finally:
-        cam.close()
+    # Same reasoning as `reference`: reuse the frame the capture loop already
+    # wrote rather than opening a competing RTSP session against it.
+    raw = None
+    if not args.live:
+        got = _latest_frame_for_reference(cfg)
+        if got:
+            raw, age = got
+            print(f"  Frame from `watch`, {age:.0f}s old.")
+    if raw is None:
+        cam = open_camera(cfg)
+        try:
+            raw = grab_sample(cam, cfg, keep_raw=True)[1]
+        finally:
+            cam.close()
+    prepared = prepare(raw, cfg)
+    print(f"  Lighting: {'INFRARED (night mode)' if frame_is_ir(raw) else 'COLOUR (daylight)'}")
     score, which = presence_score(prepared, refs, cfg["pixel_threshold"])
     verdict = "OCCUPIED" if score > cfg["presence_threshold"] else "EMPTY"
     print(f"  presence score {score:.4f}  (threshold "
@@ -2530,10 +2624,19 @@ def main():
     p.add_argument("--at", help="HH:MM, HH:MM:SS or ISO; default now")
 
     p = sub.add_parser("reference", help="capture an empty-pen reference frame")
-    p.add_argument("--label", help="condition name, default day/night by clock")
+    p.add_argument("--label", help="condition name; default day/night by whether "
+                                   "the frame is infrared")
+    p.add_argument("--live", action="store_true",
+                   help="grab straight from the camera instead of reusing the "
+                        "frame `watch` already wrote (opens a second RTSP "
+                        "session; only needed if watch is stopped)")
     p.add_argument("--force", action="store_true",
-                   help="store even if the frame looks occupied")
-    sub.add_parser("presence", help="is the pen occupied right now?")
+                   help="store even if the frame looks occupied, or the "
+                        "lighting does not match the label")
+    p = sub.add_parser("presence", help="is the pen occupied right now?")
+    p.add_argument("--live", action="store_true",
+                   help="grab straight from the camera instead of reusing the "
+                        "frame `watch` already wrote")
 
     sub.add_parser("tune", help="grid-search thresholds against labeled data")
 
