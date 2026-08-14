@@ -24,6 +24,14 @@ preview.jpg
 watch.out
 *.log
 
+# --- runtime state written by the running monitor ---
+# Not secret, but it is machine-local state (a pid, the current feed status)
+# that would be meaningless to anyone else and would conflict on every pull.
+# Ignored by name AND by the temp suffix the atomic writer uses, so a crash
+# mid-write cannot leave a stray file staged either.
+heartbeat.json
+*.tmp
+
 # Scratch for anything pulled off the Pi or backed up locally. Never tracked.
 .local/
 .backup-*/
