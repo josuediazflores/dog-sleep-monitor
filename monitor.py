@@ -1118,6 +1118,13 @@ class SleepState:
         elif not self.presence_reliable \
                 and self.ref_ok_run >= self.presence_needed:
             self.presence_reliable = True
+            # A quiet run accumulated while presence was untrusted was
+            # accumulated against an unknown pen -- spending it on the first
+            # trusted sample produced a phantom one-sample "asleep" before
+            # presence hysteresis could catch up and say "away". Same
+            # principle as the reset on emptying: runs do not survive across
+            # a change in what they are evidence of.
+            self.quiet_run = self.active_run = 0
 
     def update(self, score, corr=1.0, presence=None, presence_threshold=None,
                ref_corr=None):

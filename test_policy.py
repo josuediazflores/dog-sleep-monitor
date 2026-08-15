@@ -163,6 +163,17 @@ def main():
     r = run([STALE_STILL] * 15 + [GONE_MATCHED] * 4)
     results.append(check("fresh ref restores away detection", r[-1][0], "away"))
 
+    # Stillness racked up while the reference was untrusted is not evidence of
+    # sleep, so it must not be spendable the instant trust returns. Verified
+    # live: without the reset, restoring a reference over a still pen printed
+    # a one-sample "asleep" before presence hysteresis could say "away".
+    r = run([STALE_STILL] * 15 + [IN_STILL_MATCHED] * 12)
+    results.append(check("recovery does not spend the stale quiet run",
+                         r[-1][0], "unknown"))
+    r = run([STALE_STILL] * 15 + [IN_STILL_MATCHED] * 15)
+    results.append(check("...but a fresh full run after recovery sleeps",
+                         r[-1][0], "asleep"))
+
     print(f"\n{sum(results)}/{len(results)} passed")
     return 0 if all(results) else 1
 
