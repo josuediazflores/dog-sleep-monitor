@@ -152,6 +152,62 @@ DEFAULTS = {
                                      # occupied 0.071-0.106.          # this AND correlation below this, so a dog
                                      # filling the frame is not mistaken for the
                                      # day/night IR switch
+    "presence_ref_corr_min": 0.60,   # a presence verdict is only trusted while
+                                     # the frame still structurally resembles
+                                     # the reference it was scored against.
+                                     # Reference-diff presence has a failure
+                                     # mode the threshold cannot see: rearrange
+                                     # the crate (or nudge the camera) and an
+                                     # EMPTY pen disagrees with its own
+                                     # reference on 85% of the ROI -- far above
+                                     # any occupied threshold -- so the pen
+                                     # reads occupied, and because an empty pen
+                                     # is still, it reads asleep. That exact
+                                     # lie ran for 12 hours on 2026-08-14.
+                                     # Correlation separates the two cases
+                                     # cleanly because a dog is a *local*
+                                     # change (the rest of the scene still
+                                     # matches) while a stale reference is a
+                                     # *global* one. Measured on archived
+                                     # frames: reference matching the scene,
+                                     # dog present or not, corr 0.77-1.00;
+                                     # reference stale or lighting uncovered,
+                                     # corr 0.05-0.49. The cutoff sits in the
+                                     # middle of that gap. Below it the machine
+                                     # reports "unknown" rather than trusting
+                                     # either verdict, because with a stale
+                                     # reference an empty pen and a sleeping
+                                     # dog are genuinely indistinguishable.
+
+    # --- reference auto-refresh: re-baseline while provably empty ---
+    # The pen's contents drift (bedding, toys, the crate door) and every drift
+    # erodes the empty references. Waiting for a human to notice means the
+    # noticing usually happens after a night of wrong data. So when the pen has
+    # been *confirmed* empty and completely still for a long stretch, and the
+    # current frame has drifted measurably from the closest reference, store it
+    # as a fresh reference for the current lighting. The gates are deliberately
+    # paranoid, because a reference with a dog in it teaches the detector that
+    # dogs are normal, which is far worse than a stale reference:
+    #   - state must be "away" (presence flipped to empty through its own
+    #     hysteresis, with a trusted reference) for the entire stretch
+    #   - every sample in the stretch must be below quiet_score -- a dog cannot
+    #     enter the pen without moving, so 30 motionless minutes after a
+    #     confirmed empty means nothing has entered since
+    #   - the frame must still score below the presence threshold now, and
+    #     below refresh_max_score as an absolute ceiling (verified empty pens
+    #     measured 0.000-0.046 across all lighting; occupied floors at 0.023
+    #     night / 0.638 day)
+    "reference_auto_refresh": True,
+    "reference_refresh_minutes": 30.0,   # stretch of confirmed-empty stillness
+    "reference_refresh_min_drift": 0.005,  # skip pointless copies of a frame
+                                     # that still matches; refresh only once
+                                     # real drift has accumulated
+    "reference_refresh_max_score": 0.05,  # absolute ceiling regardless of the
+                                     # per-lighting threshold
+    "reference_max_per_label": 4,    # keep the newest N per label; empty-pen
+                                     # references are only valuable while
+                                     # recent, and an unbounded directory makes
+                                     # every presence check slower forever
 
     # timing
     "sample_seconds": 5.0,
@@ -990,12 +1046,23 @@ class SleepState:
         self.scene_corr_max = float(cfg["scene_corr_max"])
         self.presence_threshold = float(cfg["presence_threshold"])
         self.presence_needed = int(cfg["presence_samples_to_flip"])
+        self.ref_corr_min = float(cfg["presence_ref_corr_min"])
         self.state = state
         self.quiet_run = 0
         self.active_run = 0
         self.presence = "unknown"
         self.occupied_run = 0
         self.empty_run = 0
+        # Whether the reference the presence score was computed against still
+        # describes the scene. Starts trusted; collapses (with the same
+        # hysteresis as presence itself) when the frame stops correlating with
+        # every known reference, which is what a moved crate or a bumped
+        # camera looks like. While untrusted, presence verdicts are not acted
+        # on -- a "dog detected" that is really a furniture change would
+        # otherwise turn an empty pen into hours of invented sleep.
+        self.presence_reliable = True
+        self.ref_low_run = 0
+        self.ref_ok_run = 0
 
     def _update_presence(self, presence, score, threshold=None):
         """Track occupied/empty with its own hysteresis.
@@ -1025,7 +1092,35 @@ class SleepState:
             self.presence = "empty"
         return None
 
-    def update(self, score, corr=1.0, presence=None, presence_threshold=None):
+    def _update_reliability(self, ref_corr):
+        """Track whether the matched reference still describes the scene.
+
+        Hysteresis for the same reason presence has it: a person leaning over
+        the pen occludes enough of the scene to dent the correlation for a few
+        samples, and that must not toggle the whole presence layer off and on.
+        A real scene change -- furniture moved, camera nudged -- holds the
+        correlation down for every sample after it, so a short run is all the
+        confirmation needed.
+        """
+        if ref_corr < self.ref_corr_min:
+            self.ref_low_run += 1
+            self.ref_ok_run = 0
+        else:
+            self.ref_ok_run += 1
+            self.ref_low_run = 0
+        if self.presence_reliable and self.ref_low_run >= self.presence_needed:
+            self.presence_reliable = False
+            # Verdicts formed against the now-discredited reference must not
+            # linger: an occupied_run built from a stale diff is exactly the
+            # evidence being thrown out.
+            self.presence = "unknown"
+            self.occupied_run = self.empty_run = 0
+        elif not self.presence_reliable \
+                and self.ref_ok_run >= self.presence_needed:
+            self.presence_reliable = True
+
+    def update(self, score, corr=1.0, presence=None, presence_threshold=None,
+               ref_corr=None):
         """Returns (state, tag, changed).
 
         corr defaults to 1.0, meaning "structurally the same scene". presence
@@ -1035,15 +1130,34 @@ class SleepState:
         presence_threshold overrides the configured one for this sample, which
         is how the infrared and daylight cutoffs stay separate without the
         machine needing to know what a camera is.
+
+        ref_corr is the correlation between the frame and the reference the
+        presence score was computed against; None means "not measured" and
+        keeps the reference trusted, so old replays are unaffected.
         """
         if presence is not None:
-            note = self._update_presence(presence, score, presence_threshold)
-            if note == "contradiction":
-                return self.state, "empty+motion", False
-            if self.presence == "empty":
-                changed = self.state != "away"
-                self.state = "away"
-                return self.state, "away", changed
+            if ref_corr is not None:
+                was = self.presence_reliable
+                self._update_reliability(ref_corr)
+                if was and not self.presence_reliable \
+                        and self.state in ("asleep", "away"):
+                    # Both of those states are presence claims -- "she is here
+                    # and still" / "she is not here" -- and the evidence they
+                    # rest on was just discredited. Ending them at the moment
+                    # trust ends is the difference between an honest "unknown
+                    # since 08:30" and the actual 2026-08-14 failure, where a
+                    # sleep claim formed against a live reference coasted for
+                    # 12 hours after the scene changed underneath it.
+                    self.state = "unknown"
+                    return self.state, "ref-stale", True
+            if self.presence_reliable:
+                note = self._update_presence(presence, score, presence_threshold)
+                if note == "contradiction":
+                    return self.state, "empty+motion", False
+                if self.presence == "empty":
+                    changed = self.state != "away"
+                    self.state = "away"
+                    return self.state, "away", changed
 
         if score > self.scene_score and corr < self.scene_corr_max:
             # Both conditions required. A big change that stays correlated is a
@@ -1065,6 +1179,15 @@ class SleepState:
 
         changed = False
         if self.state != "asleep" and self.quiet_run >= self.quiet_needed:
+            if presence is not None and not self.presence_reliable:
+                # The one conclusion stillness must not reach here. With the
+                # reference discredited, "still" is what BOTH a sleeping dog
+                # and an empty pen look like, and asserting sleep is precisely
+                # the confident lie this guard exists to prevent. Movement can
+                # still prove "awake" on its own; stillness proves nothing, so
+                # say so and stay there until the references are refreshed.
+                changed, self.state = self.state != "unknown", "unknown"
+                return self.state, "ref-stale", changed
             self.state, changed = "asleep", True
         elif self.state != "awake" and self.active_run >= self.active_needed:
             self.state, changed = "awake", True
@@ -2177,6 +2300,44 @@ def load_references(cfg):
     return out
 
 
+def ref_dir_mtime():
+    """Modification time of the references directory, 0.0 if absent.
+
+    `watch` polls this every sample so a reference captured mid-run takes
+    effect immediately. It used to load references once at startup, which
+    meant `reference` quietly did nothing until the service was restarted --
+    and the moment you most need a fresh reference is exactly when the monitor
+    is mid-run reporting nonsense.
+    """
+    try:
+        return os.path.getmtime(REF_DIR)
+    except OSError:
+        return 0.0
+
+
+def prune_references(label, keep):
+    """Drop the oldest references for one label beyond `keep`. Returns names.
+
+    Only the label being written to is pruned, so an automatic night capture
+    can never age out the day references. Names sort chronologically because
+    they embed a zero-padded timestamp.
+    """
+    try:
+        names = sorted(n for n in os.listdir(REF_DIR)
+                       if n.startswith(f"{label}_") and n.endswith(".jpg"))
+    except OSError:
+        return []
+    doomed = names[:-keep] if keep > 0 else []
+    removed = []
+    for name in doomed:
+        try:
+            os.remove(os.path.join(REF_DIR, name))
+            removed.append(name)
+        except OSError:
+            pass
+    return removed
+
+
 def presence_score(frame_prepared, references, pixel_threshold):
     """Size of the largest contiguous change against the closest empty-pen
     reference, as a fraction of the ROI, in [0, 1].
@@ -2194,11 +2355,23 @@ def presence_score(frame_prepared, references, pixel_threshold):
     largest blob barely moved over the same drift (0.014 -> 0.033) while an
     occupied pen sat at 0.071-0.106.
 
-    Returns (score, which_reference_matched).
+    Also returns the Pearson correlation against the reference that won,
+    because the score alone cannot tell "a dog is here" from "this reference
+    no longer describes the room". Both produce a large blob. But a dog leaves
+    the rest of the scene intact -- crate, walls, floor all still line up with
+    the reference, so correlation stays high (measured 0.77-1.00 with the
+    matching reference, occupied or not) -- while a moved crate or a nudged
+    camera misregisters *everything* and correlation collapses (measured
+    0.05-0.49 across every stale-scene case on record). The caller uses that
+    to refuse to trust a verdict scored against a reference that has stopped
+    being true, instead of confidently reporting whatever the diff happens to
+    say.
+
+    Returns (score, which_reference_matched, corr_with_that_reference).
     """
     if not references:
-        return None, None
-    best, which = 1.0, None
+        return None, None, None
+    best, which, best_corr = 1.0, None, None
     for name, ref in references:
         diff = (np.abs(ref - frame_prepared) > pixel_threshold).astype(np.uint8)
         count, _labels, stats, _c = cv2.connectedComponentsWithStats(
@@ -2207,7 +2380,8 @@ def presence_score(frame_prepared, references, pixel_threshold):
                    default=0) / float(diff.size)
         if blob < best:
             best, which = blob, name
-    return best, which
+            best_corr = correlation(ref, frame_prepared)
+    return best, which, best_corr
 
 
 def frame_is_ir(raw):
@@ -2290,10 +2464,11 @@ def cmd_reference(cfg, args):
     ir = frame_is_ir(raw)
     print(f"  Lighting: {'INFRARED (night mode)' if ir else 'COLOUR (daylight)'}")
 
-    score, which = presence_score(prepared, refs, cfg["presence_pixel_threshold"])
+    score, which, ref_corr = presence_score(
+        prepared, refs, cfg["presence_pixel_threshold"])
     if score is not None:
         print(f"  Against {len(refs)} existing reference(s): closest is "
-              f"{which} at {score:.4f}")
+              f"{which} at {score:.4f} (corr {ref_corr:+.3f})")
         if score > cfg["presence_threshold"] and not args.force:
             raise SystemExit(
                 f"\n  This frame looks OCCUPIED ({score:.4f} > "
@@ -2454,14 +2629,25 @@ def cmd_presence(cfg, args):
             cam.close()
     prepared = prepare(raw, cfg)
     print(f"  Lighting: {'INFRARED (night mode)' if frame_is_ir(raw) else 'COLOUR (daylight)'}")
-    score, which = presence_score(prepared, refs, cfg["presence_pixel_threshold"])
+    score, which, ref_corr = presence_score(
+        prepared, refs, cfg["presence_pixel_threshold"])
     thr = (cfg["presence_threshold_night"] if frame_is_ir(raw)
            else cfg["presence_threshold"])
-    verdict = "OCCUPIED" if score > thr else "EMPTY"
+    if ref_corr < cfg["presence_ref_corr_min"]:
+        verdict = "UNRELIABLE (reference stale)"
+    else:
+        verdict = "OCCUPIED" if score > thr else "EMPTY"
     print(f"  presence score {score:.4f}  (threshold {thr}, "
           f"{'night' if thr == cfg['presence_threshold_night'] else 'day'})"
           f"  -> {verdict}")
-    print(f"  closest reference: {which}  of {len(refs)} known")
+    print(f"  closest reference: {which}  of {len(refs)} known, "
+          f"corr {ref_corr:+.3f} (trusted above "
+          f"{cfg['presence_ref_corr_min']:.2f})")
+    if ref_corr < cfg["presence_ref_corr_min"]:
+        print("  The frame does not structurally match ANY stored reference,\n"
+              "  so the score above says 'the scene changed', not 'a dog is\n"
+              "  here'. If the pen is empty right now, run `reference` to\n"
+              "  re-baseline it.")
 
 
 # --- dataset -----------------------------------------------------------------
@@ -2718,13 +2904,23 @@ def cmd_watch(cfg, args):
     # machine falls back to motion only, which reports an empty pen as sleep:
     # measured overnight, that cost 12 minutes of invented sleep on 2026-08-13.
     references = load_references(cfg)
+    references_mtime = ref_dir_mtime()
     if references:
         print(f"Presence: {len(references)} empty-pen reference(s) "
               f"({', '.join(n for n, _ in references)}), threshold "
-              f"{cfg['presence_threshold']}.")
+              f"{cfg['presence_threshold']}, trusted while ref-corr >= "
+              f"{cfg['presence_ref_corr_min']}.")
     else:
         print("Presence: NO references, so an empty pen will read as asleep.\n"
               "  Run `reference` while the pen is empty to fix that.")
+
+    # Auto-refresh bookkeeping; see the DEFAULTS comment for the reasoning and
+    # the full list of gates.
+    auto_refresh = bool(cfg["reference_auto_refresh"])
+    refresh_needed = max(1, int(round(
+        60.0 * float(cfg["reference_refresh_minutes"]) / interval)))
+    empty_still_run = 0
+    refresh_cooldown_until = 0.0
 
     exit_after = 60.0 * float(getattr(args, "exit_after_feed_down", 0) or 0)
     # Beat before opening the camera, and keep beating while waiting for it.
@@ -2787,9 +2983,20 @@ def cmd_watch(cfg, args):
                 prev = cur
                 continue
 
+            # Pick up references captured or refreshed while running, so a
+            # `reference` invocation (or the auto-refresh below) takes effect
+            # on the next sample instead of at the next service restart.
+            m = ref_dir_mtime()
+            if m != references_mtime:
+                references_mtime = m
+                references = load_references(cfg)
+                print(f"{stamp()}  references reloaded: "
+                      f"{', '.join(n for n, _ in references) or 'none'}")
+
             score = motion_score(prev, cur, cfg["pixel_threshold"])
             corr = correlation(prev, cur)
-            pres, _ref = presence_score(cur, references, cfg["presence_pixel_threshold"])
+            pres, _ref, ref_corr = presence_score(
+                cur, references, cfg["presence_pixel_threshold"])
             prev = cur
 
             # Which cutoff applies is a property of the frame, not the clock.
@@ -2800,7 +3007,63 @@ def cmd_watch(cfg, args):
             pres_thr = (cfg["presence_threshold_night"] if frame_is_ir(raw)
                         else cfg["presence_threshold"])
 
-            state, tag, changed = machine.update(score, corr, pres, pres_thr)
+            was_reliable = machine.presence_reliable
+            state, tag, changed = machine.update(score, corr, pres, pres_thr,
+                                                 ref_corr)
+
+            # A reference going stale is an event, not a mood. It gets one
+            # loud line and one row in events.csv the moment it happens,
+            # because from here until someone re-baselines, `away` cannot fire
+            # and stillness reports "unknown" -- a dashboard needs to say why.
+            if machine.presence_reliable != was_reliable:
+                if not machine.presence_reliable:
+                    shot = record("reference-stale", pres or 0.0, raw)
+                    print(f"{stamp()}  REFERENCE STALE: frame correlates "
+                          f"{ref_corr:+.2f} with the closest empty-pen "
+                          f"reference (trust floor "
+                          f"{cfg['presence_ref_corr_min']}). The scene has "
+                          f"changed -- crate moved, camera nudged, or a "
+                          f"lighting condition with no reference. Presence is "
+                          f"unreliable until `reference` is re-run on an "
+                          f"empty pen."
+                          + (f"  [{shot}]" if shot else ""))
+                else:
+                    record("reference-ok", pres or 0.0, raw)
+                    print(f"{stamp()}  reference trusted again "
+                          f"(corr {ref_corr:+.2f})")
+
+            # Auto-refresh: after a long, provably empty, completely still
+            # stretch, re-baseline the current lighting's reference so slow
+            # scene drift heals itself instead of accumulating into a false
+            # "occupied". Every condition below is a guard against the one
+            # catastrophic mistake -- capturing the dog -- and any motion at
+            # all restarts the clock, because a dog cannot enter without
+            # moving.
+            if (auto_refresh and state == "away" and pres is not None
+                    and machine.presence_reliable
+                    and score < machine.quiet_score
+                    and pres < min(pres_thr,
+                                   cfg["reference_refresh_max_score"])):
+                empty_still_run += 1
+            else:
+                empty_still_run = 0
+            if (empty_still_run >= refresh_needed
+                    and pres >= cfg["reference_refresh_min_drift"]
+                    and time.monotonic() >= refresh_cooldown_until):
+                label = "night" if frame_is_ir(raw) else "day"
+                os.makedirs(REF_DIR, exist_ok=True)
+                path = os.path.join(
+                    REF_DIR, f"{label}_{datetime.now():%Y%m%dT%H%M%S}.jpg")
+                cv2.imwrite(path, raw, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                dropped = prune_references(
+                    label, int(cfg["reference_max_per_label"]))
+                record("reference-refresh", pres, raw)
+                print(f"{stamp()}  auto-refreshed {label} reference after "
+                      f"{human(empty_still_run * interval)} of confirmed-empty "
+                      f"stillness (drift {pres:.4f})"
+                      + (f"; pruned {', '.join(dropped)}" if dropped else ""))
+                empty_still_run = 0
+                refresh_cooldown_until = time.monotonic() + 3600.0
             shadow.sample(raw, score, state)
             archive.save(raw, score)
             latest.save(raw)
@@ -2826,7 +3089,12 @@ def cmd_watch(cfg, args):
                 print(f"{stamp()}  --> {state.upper()}"
                       + (f"  [{shot}]" if shot else ""))
             elif cfg["print_every_sample"]:
-                pres_txt = f"  pres {pres:.3f}" if pres is not None else ""
+                # rc is the reference correlation, logged on every line
+                # because the 2026-08-14 stale-reference failure was only
+                # diagnosable from history -- and the history had presence
+                # scores but nothing that said whether they meant anything.
+                pres_txt = (f"  pres {pres:.3f} rc {ref_corr:+.2f}"
+                            if pres is not None else "")
                 print(f"{stamp()}  score {score:.4f}  {tag:<6} "
                       f"quiet {machine.quiet_run}/{quiet_needed}  "
                       f"state {state}{pres_txt}")

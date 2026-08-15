@@ -34,6 +34,17 @@ IN_MOVING = (0.100, 1.0, 0.150)
 GONE = (0.000, 1.0, 0.000)
 GONE_BUT_MOTION = (0.100, 1.0, 0.000)   # stale reference, or a person
 
+# Five-value inputs add ref_corr, the correlation between the frame and the
+# reference the presence score came from. The numbers are the real 2026-08-14
+# failure: the crate was rearranged, an EMPTY pen scored 0.84 "occupied"
+# against the old reference at corr +0.05, and the monitor reported 12 hours
+# of it. A matched reference measures corr 0.77-1.00 whether or not the dog
+# is in frame.
+IN_STILL_MATCHED = (0.000, 1.0, 0.125, None, 0.90)
+GONE_MATCHED = (0.000, 1.0, 0.000, None, 0.99)
+STALE_STILL = (0.000, 1.0, 0.840, None, 0.05)   # empty pen, moved furniture
+STALE_MOVING = (0.100, 1.0, 0.840, None, 0.05)  # ...with someone in frame
+
 
 def check(name, got, want):
     ok = got == want
@@ -116,6 +127,41 @@ def main():
                          r[-1][0], "unknown"))
     r = run([GONE] * 12 + [IN_STILL] * 13)
     results.append(check("13 still after returning -> asleep", r[-1][0], "asleep"))
+
+    # --- stale-reference honesty ---
+    # A matched reference changes nothing about the composed behaviour.
+    r = run([IN_STILL_MATCHED] * 12)
+    results.append(check("matched ref: occupied + still -> asleep",
+                         r[-1][0], "asleep"))
+    r = run([GONE_MATCHED] * 2, start="asleep")
+    results.append(check("matched ref: empty 2x -> away", r[-1][0], "away"))
+
+    # The 2026-08-14 failure: empty pen, rearranged furniture, huge presence
+    # score against a reference that no longer describes the room. The old
+    # machine called this asleep for 12 hours. It must be "unknown" -- with a
+    # stale reference, stillness proves nothing.
+    r = run([STALE_STILL] * 30, start="unknown")
+    results.append(check("stale ref never reports asleep", r[-1][0], "unknown"))
+    results.append(check("...and the sample is tagged", r[-1][1], "ref-stale"))
+    r = run([STALE_STILL] * 30, start="asleep")
+    results.append(check("stale ref ends an in-progress sleep claim",
+                         r[-1][0], "unknown"))
+
+    # One low-correlation sample is an occlusion, not a scene change.
+    r = run([IN_STILL_MATCHED] * 11 + [STALE_STILL] + [IN_STILL_MATCHED])
+    results.append(check("1 low-corr sample does not break trust",
+                         r[-1][0], "asleep"))
+
+    # Movement stands on its own: motion needs no reference to mean activity.
+    r = run([STALE_MOVING] * 2, start="unknown")
+    results.append(check("stale ref still allows waking on motion",
+                         r[-1][0], "awake"))
+
+    # Recapturing a reference (frames match again) restores the full machine:
+    # trust flips back after the same 2-sample hysteresis, and an empty pen
+    # can read away again.
+    r = run([STALE_STILL] * 15 + [GONE_MATCHED] * 4)
+    results.append(check("fresh ref restores away detection", r[-1][0], "away"))
 
     print(f"\n{sum(results)}/{len(results)} passed")
     return 0 if all(results) else 1
