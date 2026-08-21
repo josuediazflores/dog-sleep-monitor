@@ -858,7 +858,7 @@ class Heartbeat:
         self.started_at = datetime.now()
         self.feed_down_since = None
 
-    def beat(self, feed_ok, last_sample_at=None, state=None):
+    def beat(self, feed_ok, last_sample_at=None, state=None, presence=None):
         if not self.path:
             return
         now = datetime.now()
@@ -876,6 +876,15 @@ class Heartbeat:
             "feed_down_since": self.feed_down_since.isoformat(timespec="seconds")
             if self.feed_down_since else None,
             "state": state,
+            # What the presence layer believes and whether it trusts itself.
+            # This is the only place that knowledge leaves the watch process:
+            # when the 2026-08-15 camera move discredited every reference, the
+            # API could only say "unknown" -- not "unknown because the
+            # references are stale" -- and the gap went unexplained on the
+            # dashboard for five days. None means "no sample yet this run" or
+            # a heartbeat written before this field existed; both read as
+            # "not measured", never as a verdict.
+            "presence": presence,
         }
         _write_atomic(
             self.path,
@@ -2088,15 +2097,44 @@ def monitor_status(cfg):
     }
 
 
+def presence_status(cfg):
+    """What the presence layer believes right now, and whether to trust it.
+
+    Read from the heartbeat, because the log rows cannot carry it: "unknown"
+    in the log is one word for two situations a client must word differently
+    -- "the machine has not decided yet" and "every reference is stale, so
+    away/asleep are disabled until someone re-baselines an empty pen". The
+    second one is an actionable outage; it once ran for five days flying the
+    same flag as the first.
+
+    reliable None means "not measured" -- an old heartbeat, or a watch that
+    has not completed a sample this run. trust_floor ships alongside ref_corr
+    so a client can render "0.53 against a 0.60 floor" without knowing the
+    config.
+    """
+    hb = read_heartbeat(cfg) or {}
+    p = hb.get("presence")
+    if not isinstance(p, dict):
+        p = {}
+    return {
+        "value": p.get("value") or "unknown",
+        "reliable": p.get("reliable"),
+        "ref_corr": p.get("ref_corr"),
+        "references": p.get("references"),
+        "trust_floor": float(cfg["presence_ref_corr_min"]),
+    }
+
+
 def live_state(cfg):
     """Current state and when it began, for an in-progress sleep banner."""
     mon = monitor_status(cfg)
     frame = frame_status(cfg)
+    presence = presence_status(cfg)
     rows = read_log(cfg, tail_bytes=int(cfg.get("api_log_tail_bytes") or 0))
     if not rows:
         return {"state": "unknown", "since": None, "elapsed_s": 0,
                 "last_sample": None, "stale": True, "stale_for_s": 0,
-                "monitor": mon, "frame": frame}
+                "monitor": mon, "frame": frame, "presence": presence}
     sessions, _gaps = sessionize(rows, float(cfg["sample_seconds"]))
     last = sessions[-1] if sessions else None
     age = (datetime.now() - rows[-1][0]).total_seconds()
@@ -2118,6 +2156,10 @@ def live_state(cfg):
         # different sentences.
         "monitor": mon,
         "frame": frame,
+        # Same principle for "unknown": presence.reliable false means the
+        # references are stale and re-baselining is the fix, which is a
+        # different sentence from "still deciding".
+        "presence": presence,
     }
 
 
@@ -3074,7 +3116,14 @@ def cmd_watch(cfg, args):
             shadow.sample(raw, score, state)
             archive.save(raw, score)
             latest.save(raw)
-            beat.beat(feed_ok=True, last_sample_at=datetime.now(), state=state)
+            beat.beat(feed_ok=True, last_sample_at=datetime.now(), state=state,
+                      presence={
+                          "value": machine.presence,
+                          "reliable": machine.presence_reliable,
+                          "ref_corr": None if ref_corr is None
+                          else round(ref_corr, 3),
+                          "references": len(references),
+                      })
 
             if time.monotonic() >= next_snap:
                 record("periodic", score, raw)

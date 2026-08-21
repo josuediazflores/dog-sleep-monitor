@@ -181,6 +181,24 @@ the feed-down branch, with three sample intervals of slack. A client that shows
 a sleep banner without checking it will cheerfully report "asleep for 6 hours"
 when nothing has been running for 6 hours.
 
+### Presence: `state` says "unknown", `presence` says why
+
+```json
+"presence": { "value": "occupied", "reliable": false, "ref_corr": 0.53,
+              "references": 5, "trust_floor": 0.6 }
+```
+
+`state: "unknown"` is one word for two situations that need different
+sentences. When `presence.reliable` is `false`, every empty-pen reference has
+stopped matching the scene (camera moved, crate rearranged, a lighting
+condition with no capture) and both `away` and `asleep` are deliberately
+disabled until `reference` is re-run on an empty pen -- that is an actionable
+outage, not a transient. When `reliable` is `true` or `null`, "unknown" is
+just the machine between verdicts. `ref_corr` is the frame's correlation with
+the closest reference; render it against `trust_floor` if you want to show how
+far off the scene is. `reliable: null` means not measured (no sample yet this
+run, or a heartbeat from an older monitor).
+
 So a night reads as one 7h04m sleep with 5 stirs, not six separate sleep events.
 A data gap always breaks a merge, since sleep across an unobserved stretch is an
 assumption, not a measurement.
