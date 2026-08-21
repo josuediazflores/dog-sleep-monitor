@@ -199,6 +199,24 @@ the closest reference; render it against `trust_floor` if you want to show how
 far off the scene is. `reliable: null` means not measured (no sample yet this
 run, or a heartbeat from an older monitor).
 
+### Session: `elapsed_s` resets on every stir, `session` does not
+
+```json
+"session": { "kind": "sleep", "start": "2026-08-21T03:11:02Z",
+             "elapsed_s": 4380, "stirs": 2, "in_stir": false }
+```
+
+Dogs are polyphasic: a reposition mid-sleep flips `state` to `awake` for a
+minute and resets the top-level `since`/`elapsed_s`, so an hour of sleep with
+one stir reads "asleep 3m". `session` is the merged in-progress sleep block --
+the same merge `/v1/events` applies retrospectively (awake/unknown gaps under
+`api_merge_stirs_minutes` fold in as stirs), reported live. `null` whenever no
+sleep block is open: she is properly awake, away, or the block was closed by a
+data gap. `in_stir: true` means she is moving right now but the movement has
+not yet outlasted the merge window -- render "stirring", not "woke up". The
+block only becomes a `/v1/events` entry once it closes; an open block is never
+exported there, so the two views never disagree about a finished sleep.
+
 So a night reads as one 7h04m sleep with 5 stirs, not six separate sleep events.
 A data gap always breaks a merge, since sleep across an unobserved stretch is an
 assumption, not a measurement.

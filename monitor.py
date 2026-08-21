@@ -255,7 +255,14 @@ DEFAULTS = {
     "api_token_env": "MONITOR_API_TOKEN",
     "api_min_session_minutes": 10,   # shorter stretches are not "a sleep"
     "api_merge_stirs_minutes": 10,   # awake gaps below this merge into one sleep
-    "api_log_tail_bytes": 131072,    # live_state reads only the tail; 0 = all
+    "api_log_tail_bytes": 524288,    # live_state reads only the tail; 0 = all.
+                                     # Sized so the tail spans a full night
+                                     # (~16k rows, ~22h at 5s): live_state now
+                                     # reports the merged in-progress sleep
+                                     # block, and a tail shorter than the
+                                     # night would clip an 8h sleep's start
+                                     # at the tail boundary and quietly floor
+                                     # the elapsed time it reports.
 }
 
 
@@ -1936,6 +1943,13 @@ def consolidate_sleep(sessions, gaps, merge_s):
     entries. A long awake span closes the sleep. A data gap also closes it and
     marks it partial, because the end time is then unknown: the monitor was not
     watching when it actually ended.
+
+    Every closed span carries `closed_by` ("gap", "empty", "away", "wake");
+    a span with no `closed_by` was still accumulating when the data ran out --
+    which for a live log means it is happening right now. live_state leans on
+    exactly that distinction, because "asleep for 1h12m, currently mid-stir"
+    and "that sleep ended, she is up" are decided by how the block ended, not
+    by when.
     """
     spans = sorted(
         [(s["start"], s["end"], s["state"], s["duration"]) for s in sessions]
@@ -1943,6 +1957,13 @@ def consolidate_sleep(sessions, gaps, merge_s):
         key=lambda t: t[0])
 
     out, cur = [], None
+
+    def close(reason):
+        nonlocal cur
+        cur["closed_by"] = reason
+        out.append(cur)
+        cur = None
+
     for start, end, state, duration in spans:
         if state == "asleep":
             if cur is None:
@@ -1953,18 +1974,19 @@ def consolidate_sleep(sessions, gaps, merge_s):
         elif state == "gap":
             if cur is not None:
                 cur["partial"] = True
-                out.append(cur)
-                cur = None
-        elif state == "empty":
-            # Known to be dogless. Closes the sleep cleanly rather than partial:
-            # we know exactly when it ended, because she was taken out.
+                close("gap")
+        elif state in ("empty", "away"):
+            # Known to be dogless -- "empty" marked by hand, "away" seen by the
+            # presence check. Closes the sleep cleanly rather than partial: we
+            # know exactly when it ended, because she left. Before "away" was
+            # listed here it fell through to no clause at all, and a sleep,
+            # 20 dogless minutes, and another sleep merged into one unbroken
+            # block with zero stirs.
             if cur is not None:
-                out.append(cur)
-                cur = None
+                close(state)
         elif state in ("awake", "unknown") and cur is not None \
                 and duration > merge_s:
-            out.append(cur)
-            cur = None
+            close("wake")
     if cur is not None:
         out.append(cur)
     return out
@@ -1990,6 +2012,13 @@ def sleep_events(cfg, since=None, min_minutes=None, merge_minutes=None):
     sessions, gaps = sessionize(rows, float(cfg["sample_seconds"]))
     events = []
     for sp in consolidate_sleep(sessions, gaps, merge_s):
+        if "closed_by" not in sp:
+            # Still accumulating -- tonight's sleep, mid-sleep. Exporting it
+            # would freeze it at pull time forever: the id is derived from the
+            # start, PupLog merges by set-union on id, so the first pulled
+            # version wins and a 2h snapshot of an 8h night sticks. It becomes
+            # an event when it ends; until then it is /v1/state's `session`.
+            continue
         duration = (sp["end"] - sp["start"]).total_seconds()
         if duration < min_s:
             continue
@@ -2134,10 +2163,37 @@ def live_state(cfg):
     if not rows:
         return {"state": "unknown", "since": None, "elapsed_s": 0,
                 "last_sample": None, "stale": True, "stale_for_s": 0,
-                "monitor": mon, "frame": frame, "presence": presence}
-    sessions, _gaps = sessionize(rows, float(cfg["sample_seconds"]))
+                "monitor": mon, "frame": frame, "presence": presence,
+                "session": None}
+    sessions, gaps = sessionize(rows, float(cfg["sample_seconds"]))
     last = sessions[-1] if sessions else None
     age = (datetime.now() - rows[-1][0]).total_seconds()
+
+    # The merged in-progress sleep block, if one is running. `state` +
+    # `elapsed_s` above reset on every stir, which makes an hour of sleep with
+    # one reposition read as "still 3m" -- true sample by sample and wrong as
+    # a sentence. The dog is polyphasic; the block is the truth a human wants.
+    # Only the LAST consolidated block can be live, and only if nothing closed
+    # it: a block closed by "away"/"empty" (she left), "wake" (a wake longer
+    # than the merge window), or "gap" (nobody was watching) is history, no
+    # matter how recently it ended.
+    session = None
+    blocks = consolidate_sleep(
+        sessions, gaps, 60.0 * float(cfg["api_merge_stirs_minutes"]))
+    if blocks and "closed_by" not in blocks[-1]:
+        block = blocks[-1]
+        session = {
+            "kind": "sleep",
+            "start": iso(block["start"]),
+            "elapsed_s": int((datetime.now()
+                              - block["start"]).total_seconds()),
+            "stirs": block["stirs"],
+            # She is moving right now, inside a block that is still open --
+            # i.e. the movement has not yet outlasted the merge window. A
+            # client can say "stirring" instead of pretending she woke up.
+            "in_stir": bool(last and last["state"] != "asleep"),
+        }
+
     return {
         "state": last["state"] if last else "unknown",
         "since": iso(last["start"]) if last else None,
@@ -2160,6 +2216,9 @@ def live_state(cfg):
         # references are stale and re-baselining is the fix, which is a
         # different sentence from "still deciding".
         "presence": presence,
+        # Null, or the merged in-progress sleep block (see above). Survives
+        # stirs that reset `state`/`elapsed_s`.
+        "session": session,
     }
 
 
