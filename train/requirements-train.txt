@@ -1,0 +1,17 @@
+# Mac-only. The Pi never installs any of this: it loads the exported ONNX
+# through the python3-opencv it already has, and that is the whole point of
+# exporting rather than shipping a framework.
+#
+#   uv venv --python 3.12 train/.venv
+#   uv pip install --python train/.venv/bin/python -r train/requirements-train.txt
+#
+# Nothing is pinned. This is a training rig on one laptop, not a deployment;
+# pinning would mean maintaining pins for a script that runs a handful of times
+# a year. The versions that actually produced a model are recorded in the
+# sidecar json next to it.
+torch
+torchvision
+onnx
+onnxruntime
+opencv-python-headless
+numpy

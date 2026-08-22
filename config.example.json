@@ -56,5 +56,14 @@
   "api_min_session_minutes": 10,
   "api_merge_stirs_minutes": 10,
   "presence_threshold": 0.05,
-  "presence_samples_to_flip": 2
+  "presence_samples_to_flip": 2,
+  "presence_model": null,
+  "presence_model_input": [
+    160,
+    128
+  ],
+  "presence_model_threshold": 0.5,
+  "presence_model_deadband": 0.15,
+  "presence_model_log": "presence_model.csv",
+  "presence_model_shadow": false
 }

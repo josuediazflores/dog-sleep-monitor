@@ -36,6 +36,15 @@ heartbeat.json
 .local/
 .backup-*/
 
+# --- trained models ---
+# Weights derived from imagery of the inside of a home, and a few MB each. The
+# repo is public; artifacts stay on this laptop and on the Pi. models/README.md
+# is tracked so the directory still explains itself.
+models/*.onnx
+models/*.json
+models/*.pt
+models/*.pth
+
 # --- python ---
 .venv/
 __pycache__/

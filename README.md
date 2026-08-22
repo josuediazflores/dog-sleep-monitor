@@ -1,14 +1,17 @@
 # dog-sleep-monitor
 
 Detects whether the dog in the playpen is still or moving, using frame
-differencing from a fixed camera. No model, no training, no dataset.
+differencing from a fixed camera. The motion half needs no model, no training
+and no dataset.
 
 Works with a TP-Link Tapo (or any RTSP camera) over the network, and with USB
 webcams. Set `source` in `config.json` to `"rtsp"` or `"usb"`.
 
 It reports **stillness**, which for a fixed camera on a playpen is a decent
-proxy for sleep. It cannot tell "asleep" from "awake but not moving", and it
-cannot tell "asleep" from "pen is empty". Those need a model.
+proxy for sleep. It cannot tell "asleep" from "awake but not moving". Telling
+"asleep" from "pen is empty" is a separate layer called presence, which is
+optional and has two implementations: diffing against stored empty-pen frames,
+or a trained dog/no-dog classifier. See [Presence: classifier](#presence-classifier).
 
 ## Setup
 
@@ -222,6 +225,82 @@ The score is the fraction of pixels that changed by more than
 Waking is deliberately fast to detect and sleeping deliberately slow, since a
 dog holding still for 10 seconds is common and a dog still for a minute is not.
 
+## Presence: classifier
+
+Motion detection cannot tell a sleeping dog from an empty pen, because both are
+perfectly still. Presence is the layer that answers that, and it has two
+implementations. The original one keeps a few frames of the empty pen and diffs
+against the closest match. It works until the pen is rearranged, and then it
+does not degrade, it inverts: a toy dragged three inches makes the same
+contiguous blob a curled-up dog does, and overnight on this camera an
+empty-but-rearranged pen measured 0.045 against a sleeping dog's 0.023. No
+threshold fixes an ordering. Reference-differencing answers "does this frame
+differ from an empty pen", and the question is "is there a dog in this
+picture". So the second implementation is a small dog/no-dog classifier trained
+on the monitor's own archived frames, which answers the actual question and does
+not care that the blanket moved.
+
+It runs through OpenCV's DNN module from an ONNX file, so the Pi needs nothing
+beyond the `python3-opencv` it already has. Training happens on the Mac.
+
+```bash
+python monitor.py label-presence --from 22:00 --to 06:00 --label dog
+python monitor.py label-presence --from 08:00 --to 09:30 --label empty
+python monitor.py dataset --archive .local/pi/archive --labeled-only
+python train/train_presence.py --epochs 20 --out models/presence.onnx
+python train/verify_onnx.py --model models/presence.onnx --frame <a frame>
+```
+
+Then copy the `.onnx` and its sidecar `.json` to the Pi's `models/` and set
+`presence_model`. Deploying is a deliberate human step, and there is a Pi-side
+load check to run first, because the Pi's OpenCV is from 2022 and implements a
+subset of ONNX. The whole workflow, including that check and why the export
+targets opset 10, is in **`train/README.md`**.
+
+| key | default | what |
+| --- | --- | --- |
+| `presence_model` | `null` | path to the ONNX, e.g. `models/presence.onnx`. `null` keeps reference-diff presence exactly as it was. |
+| `presence_model_input` | `[160, 128]` | `[width, height]` the graph expects. The sidecar json overrides this and says so loudly on a mismatch. |
+| `presence_model_threshold` | `0.5` | p(dog) above this means occupied |
+| `presence_model_deadband` | `0.15` | ...but only above `threshold + deadband`. Below `threshold - deadband` means empty. **In between the sample abstains** and the machine holds whatever it believed. |
+| `presence_model_log` | `presence_model.csv` | one row per sample: `timestamp, p, vote, ref_presence, ref_corr, ir` |
+| `presence_model_shadow` | `false` | `true` loads, predicts, logs and reports p on every sample but leaves the **references driving**. `source` stays `reference` and `shadow` is `true` on `/v1/state`. Run a new model like this for a day first. |
+
+The deadband is the point. The reference layer had no way to say "I do not
+know" and had to pick a side on every frame, which is how one ambiguous frame
+became a state flip. A classifier's uncertainty is right there in p. Deadband
+plus `presence_samples_to_flip` is the whole smoothing story; there is no third
+layer and there should not be one.
+
+An abstain carries the last decisive vote forward. "I do not know" means no
+new information, not "the pen changed", and the machine cannot be told that
+directly: fed nothing, a pen last voted empty falls into the stillness logic
+and twelve quiet abstains later reads asleep. So the watch loop repeats the
+last real vote until the model changes its mind, and the machine's own
+interlock still applies to it (a carried "empty" plus motion is held and
+tagged, never promoted to sleep).
+
+Deploy a new model in shadow first: `presence_model_shadow: true`. It predicts
+and logs every sample, the journal shows `p` and the vote next to the reference
+diff, `/v1/state` carries `p_dog` with `shadow: true`, and nothing rests on it.
+After a day of `presence_model.csv`, including a night of IR rows, flip shadow
+off.
+
+`presence_model.csv` is calibration data, not a debug log. The reference diff
+keeps being computed on every sample even while the model drives, so the two
+sit side by side in that file: it is what the threshold and deadband get tuned
+against later, and what proves the model beat the references rather than merely
+replaced them. Read a night of it, especially the IR rows, before trusting it.
+
+**References remain the fallback.** With no model configured, nothing about the
+monitor changes. With a model configured that fails to load or throws mid-run,
+it prints one loud line, exposes the reason as `model_error` on `/v1/state`,
+and carries on with reference-diff presence. The auto-refresh keeps
+re-baselining the references the whole time a model is running, precisely so
+the fallback stays warm. A model file is not worth a monitor that stops
+watching a dog, and the model hot-reloads on mtime, so replacing one mid-run is
+an `scp`, not a restart.
+
 ## RTSP specifics
 
 **A background thread drains the stream.** An RTSP feed cannot be sampled on
@@ -306,6 +385,8 @@ Numbers are small and permanent. Images are large and temporary.
 | `sleep_log.csv` | timestamp, score, state, transition, every 5s | keep, flushed per sample |
 | `events.csv` | timestamp, kind, score, image path | keep, the index into snapshots |
 | `calibration.csv` | labeled score windows | keep |
+| `presence_labels.csv` | hand-labeled dog/empty windows | keep, the classifier's ground truth |
+| `presence_model.csv` | per-sample `p`, vote, and the reference diff beside it | keep, this is what the thresholds get tuned against |
 | `snapshots/` | one jpeg per state change, scene change, and every 15 min | ~54KB each, pruned after `snapshot_retention_days` |
 | `archive/` | one jpeg per **sample** when `archive_all_samples` is on | ~56KB each, ~40MB/hour |
 | `watch.out` | console output | appended across restarts |
@@ -334,18 +415,26 @@ only with `--yes`. Never touches the CSVs, since the numbers are what you keep.
 ## Tests
 
 ```bash
-.venv/bin/python test_math.py && .venv/bin/python test_policy.py
+.venv/bin/python test_math.py \
+  && .venv/bin/python test_policy.py \
+  && .venv/bin/python test_presence.py
 ```
 
-Both camera-free.
+All three camera-free, and `test_presence.py` needs no model file either.
 
-- `test_math.py` (10 cases): synthetic room, noise immunity, exposure and gain
+- `test_math.py` (12 cases): synthetic room, noise immunity, exposure and gain
   immunity, movement detection, the IR scene-change guard, and resolution
   independence of the fractional ROI.
-- `test_policy.py` (12 cases): the `SleepState` machine. Pins the 12-quiet and
+- `test_policy.py` (34 cases): the `SleepState` machine. Pins the 12-quiet and
   2-active run lengths, that the deadband advances nothing but preserves a run
   across itself, and that a scene change resets both counters rather than
   registering as movement.
+- `test_presence.py` (51 cases): the learned presence layer around the model.
+  Label windows and their overlap rule, p to vote including both boundaries,
+  how a vote reaches the state machine, and model votes driving away/asleep
+  with reference trust deliberately untouched. The classifier itself is a
+  black box in an ONNX file; what these pin is everything that decides whether
+  a night gets recorded honestly.
 
 ## Measured on this setup, 2026-08-12
 

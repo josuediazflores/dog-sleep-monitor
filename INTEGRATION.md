@@ -185,8 +185,14 @@ when nothing has been running for 6 hours.
 
 ```json
 "presence": { "value": "occupied", "reliable": false, "ref_corr": 0.53,
-              "references": 5, "trust_floor": 0.6 }
+              "references": 5, "trust_floor": 0.6,
+              "source": "model", "p_dog": 0.9731, "model_error": null,
+              "shadow": false }
 ```
+
+`shadow: true` means a model is loaded and `p_dog` is real, but the
+references still produced `value` (`source` will say `"reference"`). It is a
+rehearsal; render `p_dog` as information, not as the verdict.
 
 `state: "unknown"` is one word for two situations that need different
 sentences. When `presence.reliable` is `false`, every empty-pen reference has
@@ -198,6 +204,35 @@ just the machine between verdicts. `ref_corr` is the frame's correlation with
 the closest reference; render it against `trust_floor` if you want to show how
 far off the scene is. `reliable: null` means not measured (no sample yet this
 run, or a heartbeat from an older monitor).
+
+**`source` says which layer produced `value`**, and it decides which of the
+other fields mean anything:
+
+| `source` | what is answering | the field that matters |
+| --- | --- | --- |
+| `"model"` | the learned dog/no-dog classifier | `p_dog` |
+| `"reference"` | diffing against stored empty-pen frames | `reliable`, `ref_corr` |
+| `"none"` | nothing; presence is not measured | neither |
+| `null` | a heartbeat written before this field existed | neither |
+
+Under `"model"`, `reliable` is always `true` and `ref_corr` is along for the
+ride: the classifier never reads the references, so their staleness says
+nothing about whether it can see a dog, and a client that greys out presence on
+`ref_corr` alone will hide a layer that is working fine. Under `"none"` there
+is no presence layer at all and an empty pen reads as asleep, which is worth
+saying out loud rather than rendering as a transient "unknown".
+
+`p_dog` is the classifier's raw probability for the last sample, before the
+deadband turned it into a verdict. `null` when no model is running, or when
+that sample's forward pass failed. Values near 0.5 are the model declining to
+vote, which is why `value` can sit still while `p_dog` moves.
+
+`model_error` is `null` in the normal case. A string means a model is
+configured but not running -- a missing file, an ONNX op the Pi's OpenCV
+cannot import, a forward pass that threw -- and presence has quietly fallen
+back to reference-diff, so `source` will read `"reference"` or `"none"`
+alongside it. Treat it exactly like `reliable: false`: an actionable outage
+with a human fix, not a transient. The monitor keeps watching either way.
 
 ### Session: `elapsed_s` resets on every stir, `session` does not
 

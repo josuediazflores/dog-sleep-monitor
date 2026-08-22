@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """Stillness monitor for a fixed camera pointed at a dog playpen.
 
-No model, no training. Samples the camera on an interval, measures how much
-changed since the previous sample, and reports asleep / awake using a rolling
-window with hysteresis.
+Samples the camera on an interval, measures how much changed since the previous
+sample, and reports asleep / awake using a rolling window with hysteresis. The
+motion half needs no model and no training.
+
+Telling a sleeping dog from an empty pen is a separate problem, because both are
+perfectly still. That layer is presence, and it has two implementations: diffing
+against stored empty-pen frames (needs nothing), or an ONNX dog/no-dog
+classifier run through cv2.dnn (needs a trained file, see train/README.md).
+Presence is optional; without it an empty pen reads as sleep.
 
 Supports a TP-Link Tapo (or any RTSP camera) over the network, and USB webcams.
 
 Subcommands:
-    preview    grab one frame, draw the ROI, write preview.jpg
-    calibrate  collect motion scores for a while, suggest thresholds
-    watch      run the monitor
+    preview         grab one frame, draw the ROI, write preview.jpg
+    calibrate       collect motion scores for a while, suggest thresholds
+    watch           run the monitor
+    label-presence  record a dog/empty window as classifier ground truth
+    dataset         export archived frames plus those labels for training
 """
 
 import argparse
@@ -208,6 +216,66 @@ DEFAULTS = {
                                      # references are only valuable while
                                      # recent, and an unbounded directory makes
                                      # every presence check slower forever
+
+    # --- learned presence: a dog/no-dog classifier on the ROI ---
+    # Reference-differencing hit a ceiling that no threshold moves. It answers
+    # "does this frame differ from an empty pen", which is not the question. A
+    # toy dragged three inches produces the same contiguous blob a curled-up
+    # dog does, and at night the numbers invert outright: an empty-but-
+    # rearranged pen measured 0.045 while a sleeping dog measured 0.023, so
+    # every cutoff that calls the first empty also calls the second empty.
+    # A classifier answers the actual question -- "is there a dog in this
+    # picture" -- from the pixels, and does not care that the blanket moved.
+    #
+    # Runs through OpenCV's DNN module from an ONNX file, so the Pi needs
+    # nothing beyond the python3-opencv it already has. Training happens on
+    # the Mac from this monitor's own archived frames; see train/README.md.
+    "presence_model": None,          # path relative to the repo, e.g.
+                                     # "models/presence.onnx". null keeps
+                                     # reference-diff presence exactly as it
+                                     # is today, so this is a no-op until a
+                                     # model is deployed, and a fallback if
+                                     # one is ever removed.
+    "presence_model_input": [160, 128],  # [width, height] the graph expects.
+                                     # Must match the export. A sidecar
+                                     # models/presence.json written by the
+                                     # trainer carries the real numbers and
+                                     # overrides this, because a silent
+                                     # mismatch here does not crash: cv2
+                                     # happily resizes to the wrong shape and
+                                     # returns confident nonsense.
+    "presence_model_threshold": 0.5,  # p(dog) above this means occupied
+    "presence_model_deadband": 0.15,  # ...but only above threshold+deadband.
+                                     # Between the two the sample ABSTAINS and
+                                     # the machine is told nothing at all, so
+                                     # it holds whatever it already believed.
+                                     # The reference layer had no way to
+                                     # express "I do not know" and had to pick
+                                     # a side on every frame; a classifier's
+                                     # uncertainty is right there in p, and
+                                     # throwing it away is how a single
+                                     # ambiguous frame becomes a state flip.
+                                     # Deadband plus presence_samples_to_flip
+                                     # is the whole smoothing story. Do not
+                                     # add a third layer.
+    "presence_model_log": "presence_model.csv",  # one row per sample: p, the
+                                     # vote, and the reference-diff numbers
+                                     # alongside it. This is the calibration
+                                     # record -- it is what threshold and
+                                     # deadband get tuned against later, and
+                                     # what proves the model beat references
+                                     # rather than merely replaced them. "" or
+                                     # null disables.
+    "presence_model_shadow": False,  # True = load the model, predict, log and
+                                     # report p on every sample, but leave the
+                                     # REFERENCES driving the machine. This is
+                                     # how a new model earns the job: a day of
+                                     # presence_model.csv with the two side by
+                                     # side, read before a single verdict
+                                     # rests on it. `source` stays "reference"
+                                     # and `shadow` is true on /v1/state while
+                                     # this is on, so a dashboard cannot
+                                     # mistake a rehearsal for the real thing.
 
     # timing
     "sample_seconds": 5.0,
@@ -1471,6 +1539,59 @@ def in_empty_window(when, windows):
     return any(a <= when <= b for a, b in windows)
 
 
+PRESENCE_LABELS_PATH = os.path.join(HERE, "presence_labels.csv")
+
+
+def read_presence_labels(path=None):
+    """Hand-labeled dog/empty windows as sorted (start, end, label, notes).
+
+    Ground truth for the classifier, and deliberately a separate file from
+    markers.csv. Markers are an operational note -- "she is out right now, do
+    not count this as sleep" -- written live and often only half of a pair.
+    These are a retrospective claim about a stretch of the archive, written
+    after looking at the frames, and both halves are always known. Mixing them
+    would mean an unclosed `out` marker silently labeled every frame since as
+    training data.
+
+    `path` is a parameter so a throwaway label file can be pointed at without
+    touching the real one; nothing but tests and experiments should pass it.
+    Malformed rows are skipped rather than fatal: this file is edited by hand.
+    """
+    p = path or PRESENCE_LABELS_PATH
+    if not os.path.exists(p):
+        return []
+    out = []
+    with open(p) as fh:
+        for r in csv.DictReader(fh):
+            try:
+                start = datetime.fromisoformat(r["start"])
+                end = datetime.fromisoformat(r["end"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            label = (r.get("label") or "").strip()
+            if label not in ("dog", "empty") or end <= start:
+                continue
+            out.append((start, end, label, (r.get("notes") or "").strip()))
+    out.sort()
+    return out
+
+
+def presence_label_at(when, windows):
+    """'dog', 'empty', or None if the moment was never labeled.
+
+    Later windows win on overlap. Overlaps are a correction, not a conflict:
+    labeling a whole night `dog` and then a 20-minute vet trip inside it
+    `empty` is the natural way to write this by hand, and the later, narrower
+    claim is the one that was made with the frames in front of you. Windows
+    are sorted by start, so scanning to the end picks the last match.
+    """
+    found = None
+    for start, end, label, _notes in windows:
+        if start <= when <= end:
+            found = label
+    return found
+
+
 def _tail_lines(path, tail_bytes):
     """Return the last whole lines of a file, plus the header line.
 
@@ -1582,6 +1703,46 @@ def cmd_mark(cfg, args):
             print(f"  Marked at {when:%H:%M:%S}, but no open 'out' marker found.")
     total = sum((b - a).total_seconds() for a, b in windows)
     print(f"  {len(windows)} empty window(s) on record, {human(total)} total.")
+
+
+def cmd_label_presence(cfg, args):
+    """Claim that a window of the archive was dog-occupied, or empty.
+
+    The training labels. Mirrors `label`, which tags windows quiet/active for
+    threshold tuning; this one tags them dog/empty for the classifier. Both
+    exist because a human looking at frames is the only source of truth either
+    layer has.
+
+    Windows are appended, never merged or deduplicated. A later window
+    overrides an earlier one where they overlap (see presence_label_at), so
+    correcting a mistake is a matter of labeling the smaller window again
+    rather than editing the file.
+    """
+    start, end = parse_when(args.start), parse_when(args.end)
+    if end <= start:
+        raise SystemExit("--to must be after --from.")
+
+    is_new = not os.path.exists(PRESENCE_LABELS_PATH)
+    with open(PRESENCE_LABELS_PATH, "a", newline="") as fh:
+        wr = csv.writer(fh)
+        if is_new:
+            wr.writerow(["start", "end", "label", "notes"])
+        wr.writerow([start.isoformat(timespec="seconds"),
+                     end.isoformat(timespec="seconds"),
+                     args.label, args.notes or ""])
+
+    windows = read_presence_labels()
+    print(f"  Labeled {start:%Y-%m-%d %H:%M} to {end:%H:%M} as "
+          f"'{args.label}' ({human((end - start).total_seconds())}).")
+    for label in ("dog", "empty"):
+        rows = [w for w in windows if w[2] == label]
+        secs = sum((b - a).total_seconds() for a, b, _l, _n in rows)
+        print(f"    {label:<6}{len(rows):>4} window(s)  {human(secs)}")
+    total = sum((b - a).total_seconds() for a, b, _l, _n in windows)
+    print(f"    {'total':<6}{len(windows):>4} window(s)  {human(total)}")
+    print(f"  {os.path.relpath(PRESENCE_LABELS_PATH, HERE)}")
+    print("  Export the frames inside these windows with:\n"
+          "    python monitor.py dataset --labeled-only")
 
 
 def sessionize(rows, interval, gap_factor=3.0):
@@ -2140,6 +2301,15 @@ def presence_status(cfg):
     has not completed a sample this run. trust_floor ships alongside ref_corr
     so a client can render "0.53 against a 0.60 floor" without knowing the
     config.
+
+    `source` says which layer produced `value`, because the two answer
+    different questions and fail differently. 'reference' means diffing
+    against stored empty-pen frames, where `reliable` and `ref_corr` are the
+    story. 'model' means the learned classifier, where `p_dog` is, and where
+    `reliable` is always true because there is no reference left to distrust.
+    'none' means neither is configured, so presence is not being measured at
+    all and an empty pen will read as sleep. null means the heartbeat predates
+    this field.
     """
     hb = read_heartbeat(cfg) or {}
     p = hb.get("presence")
@@ -2151,6 +2321,20 @@ def presence_status(cfg):
         "ref_corr": p.get("ref_corr"),
         "references": p.get("references"),
         "trust_floor": float(cfg["presence_ref_corr_min"]),
+        "source": p.get("source"),
+        # The classifier's raw probability for the last sample, before the
+        # deadband turned it into a vote. Null when no model is running, or
+        # when the sample abstained on a failed forward pass.
+        "p_dog": p.get("p_dog"),
+        # Why the classifier is not running despite being configured. Null is
+        # the normal case; a string here is an actionable outage in exactly
+        # the way `reliable: false` is, and means presence has quietly fallen
+        # back to reference-diff.
+        "model_error": p.get("model_error"),
+        # True while a model is loaded and logging but the references still
+        # drive (presence_model_shadow). p_dog is then a rehearsal, not the
+        # basis of `value`.
+        "shadow": p.get("shadow"),
     }
 
 
@@ -2519,6 +2703,274 @@ def frame_is_ir(raw):
     return float(spread.mean()) < 3.0
 
 
+# --- learned presence --------------------------------------------------------
+#
+# CANONICAL PREPROCESSING. Every number below is duplicated in
+# train/preprocess.py, which the trainer and the ONNX exporter use. They must
+# stay in lockstep: the model learns whatever pipeline fed it, and a half-pixel
+# disagreement in the resize is enough to move p by more than the deadband.
+# monitor.py cannot import from train/ (the Pi has no torch and never will), so
+# the contract is written out in both places and checked by train/verify_onnx.py,
+# which imports THIS module and asserts the two produce identical tensors.
+#
+#   1. crop the ROI from the raw BGR frame, by fraction (roi_pixels)
+#   2. greyscale                     -- the camera is greyscale half the day
+#                                       anyway, under IR, so colour is a
+#                                       feature that exists only in daylight
+#   3. resize to [w, h], INTER_AREA  -- the same downsampler `prepare` uses;
+#                                       area-averaging is what makes the
+#                                       archive's JPEG grain harmless
+#   4. scale to 0..1 float32
+#   5. replicate to 3 identical channels, NCHW
+#
+# ImageNet mean/std normalization is baked INTO the ONNX graph by the exporter,
+# not applied here, so this side never has to know the constants and cannot
+# drift from them.
+
+VOTE_WORDS = {"occupied": "occ", "empty": "empty"}
+
+
+def model_blob(raw, roi, size):
+    """The exact tensor the classifier is fed: float32 NCHW [1, 3, h, w], 0..1.
+
+    Kept separate from PresenceModel so it can be called without a model file,
+    which is what lets the trainer's preprocessing be diffed against it.
+    """
+    if roi:
+        h, w = raw.shape[:2]
+        x, y, rw, rh = roi_pixels(roi, w, h)
+        raw = raw[y:y + rh, x:x + rw]
+    gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY) if raw.ndim == 3 else raw
+    gray = cv2.resize(gray, (int(size[0]), int(size[1])),
+                      interpolation=cv2.INTER_AREA)
+    gray = gray.astype(np.float32) / 255.0
+    # Manual NCHW rather than blobFromImage: blobFromImage would happily do its
+    # own resize and channel swap on top of the ones above, and the failure
+    # mode of getting that wrong is a model that still returns a plausible
+    # number.
+    return np.ascontiguousarray(np.repeat(gray[None, None, :, :], 3, axis=1))
+
+
+def model_vote(p, threshold, deadband):
+    """'occupied', 'empty', or None for "too close to call".
+
+    Pure, so the three branches and both boundaries are testable without a
+    model file. None is not a failure: it is the sample declining to vote, and
+    the machine holds state when it gets one. See the DEFAULTS comment on
+    presence_model_deadband for why that matters more than it looks.
+    """
+    if p >= threshold + deadband:
+        return "occupied"
+    if p <= threshold - deadband:
+        return "empty"
+    return None
+
+
+def vote_to_presence(vote):
+    """Map a vote onto the (presence, presence_threshold) pair SleepState wants.
+
+    The machine takes a presence *score* and a cutoff, because reference-diff
+    presence is a continuous measurement. A classifier's output after the
+    deadband is a verdict, not a measurement, and teaching the machine a second
+    input shape to carry it would mean two code paths through the one piece of
+    logic that has already been wrong in production twice. So the verdict is
+    encoded as a score that lands unambiguously on the right side of a fixed
+    0.5 cutoff, and the machine is unchanged.
+
+    Encoding it this way keeps the interlock in _update_presence intact, which
+    is the point: flipping to empty still requires the frame to be BOTH
+    unlike-a-dog AND still. A model that briefly says "empty" while someone is
+    reaching into the pen still cannot delete real activity from the record.
+    """
+    if vote is None:
+        return None, None
+    return (1.0 if vote == "occupied" else 0.0), 0.5
+
+
+def carry_vote(vote, last_vote):
+    """The vote the machine should act on this sample, and the new last vote.
+
+    An abstain means "no new information", not "the pen changed", and the
+    machine has to be told exactly that. It cannot be told directly: its
+    presence input is a measurement, and None means "not measured at all",
+    which for a pen last voted empty drops it straight into the stillness
+    logic. Twelve quiet abstains later it would say "asleep" about a pen the
+    model never stopped believing was empty. That is the 2026-08-21 false
+    sleep again, one layer up, and a novel toy sitting in the deadband is all
+    it takes.
+
+    So an abstain repeats the last decisive vote: belief persists until the
+    model actually changes its mind. The machine's own interlock still applies
+    to the carried vote. A carried "empty" plus motion is held and tagged
+    empty+motion, never promoted to sleep; a carried "occupied" behaves as it
+    always did, asleep or awake by stillness alone.
+
+    Before the first decisive vote there is nothing to carry, and None reaches
+    the machine as "not measured", which is the honest two-state fallback.
+    """
+    if vote is None:
+        return last_vote, last_vote
+    return vote, vote
+
+
+def cv2_error_detail(exc, limit=200):
+    """The one line of a cv2 error worth putting in front of a human.
+
+    cv2 raises a stack of C++ file paths, each level quoted one '>' deeper
+    than the last, and the final line is very often just ">". Keeping the last
+    line therefore produces `model_error: ">"`, which is the field that was
+    supposed to say what went wrong saying nothing at all.
+
+    The line that matters is the one naming the node the ONNX importer choked
+    on, because the op in that name is the thing to keep out of the export.
+    Measured against cv2 4.6 on the Pi, feeding it an opset-12 graph:
+
+        Node [Clip@ai.onnx]:(onnx_node!/.../features.0.2/Clip) parse error: ...
+
+    Anything else falls back to the first real line, which at least names the
+    function that failed.
+    """
+    lines = [ln.lstrip("> ").strip() for ln in str(exc).strip().splitlines()]
+    lines = [ln for ln in lines if ln]
+    if not lines:
+        return "unknown cv2 error"
+    for ln in lines:
+        if "Node [" in ln:
+            return ln[:limit]
+    return lines[0][:limit]
+
+
+def presence_source(model_active, has_references):
+    """Which layer produced the presence verdict a client is looking at.
+
+    'none' is a real answer, not an error: with no model and no references the
+    monitor is a two-state motion detector and an empty pen reads as sleep. A
+    dashboard should say that out loud rather than render an "unknown" that
+    looks like a transient.
+    """
+    if model_active:
+        return "model"
+    return "reference" if has_references else "none"
+
+
+class PresenceModel:
+    """The ONNX dog/no-dog classifier, loaded through cv2.dnn.
+
+    A class only because there is state worth keeping: the loaded net, the
+    file's mtime, and the last load error. Everything decision-shaped is a free
+    function above so it can be tested without a model.
+
+    Hot-reloads on mtime, the same way references do, and for the same reason:
+    the moment you most want to swap the model is while the monitor is mid-run
+    getting it wrong, and "restart the service" is how a night of data gets a
+    hole in it.
+
+    A configured-but-unloadable model does NOT stop the watch loop. It prints
+    one loud line, records the error where the heartbeat can carry it to the
+    API, and leaves reference-diff presence running. The alternative is a
+    monitor that refuses to watch a dog because a file is corrupt.
+    """
+
+    def __init__(self, cfg):
+        rel = cfg.get("presence_model") or ""
+        self.rel = rel
+        self.path = os.path.join(HERE, rel) if rel else None
+        self.threshold = float(cfg["presence_model_threshold"])
+        self.deadband = float(cfg["presence_model_deadband"])
+        self.input_size = tuple(int(v) for v in cfg["presence_model_input"])
+        self.net = None
+        self.mtime = 0.0
+        self.error = None
+        self.sidecar = {}
+        if self.path:
+            self.load()
+
+    @property
+    def active(self):
+        return self.net is not None
+
+    def _sidecar_path(self):
+        return os.path.splitext(self.path)[0] + ".json"
+
+    def load(self):
+        """(Re)read the ONNX file. Never raises; sets self.error instead."""
+        self.net, self.error, self.sidecar = None, None, {}
+        try:
+            self.mtime = os.path.getmtime(self.path)
+        except OSError:
+            self.mtime = 0.0
+            self.error = f"no model file at {self.rel}"
+            return False
+
+        # The sidecar is written by the trainer and is the only record of what
+        # shape the graph actually wants. Trust it over config.json, because
+        # config.json is edited by a human at deploy time and the model is not.
+        try:
+            with open(self._sidecar_path()) as fh:
+                self.sidecar = json.load(fh)
+        except (OSError, ValueError):
+            self.sidecar = {}
+        want = self.sidecar.get("input")
+        if isinstance(want, (list, tuple)) and len(want) == 2:
+            want = (int(want[0]), int(want[1]))
+            if want != self.input_size:
+                print(f"{stamp()}  PRESENCE MODEL INPUT MISMATCH: "
+                      f"presence_model_input is {list(self.input_size)} but "
+                      f"{os.path.basename(self._sidecar_path())} says "
+                      f"{list(want)}. Using the sidecar. Feeding the wrong "
+                      f"shape does not crash -- it returns confident nonsense "
+                      f"-- so fix presence_model_input in config.json.")
+                self.input_size = want
+
+        try:
+            self.net = cv2.dnn.readNetFromONNX(self.path)
+        except cv2.error as exc:
+            self.net = None
+            self.error = f"cannot load {self.rel}: {cv2_error_detail(exc)}"
+            return False
+        return True
+
+    def reload_if_changed(self):
+        """Poll the mtime once per sample. Returns True if a new net loaded.
+
+        Cheap on purpose: one stat() against a 5 second sample interval.
+
+        Keyed strictly on the mtime changing, so a model that failed to load
+        (or failed a forward pass) stays failed until the file is actually
+        replaced. Retrying a broken graph every 5 seconds forever would burn a
+        readNetFromONNX per sample and never produce a different answer.
+        """
+        if not self.path:
+            return False
+        try:
+            m = os.path.getmtime(self.path)
+        except OSError:
+            m = 0.0
+        if m == self.mtime:
+            return False
+        return self.load()
+
+    def predict(self, raw, cfg):
+        """p(dog is in the pen) for one raw BGR frame, or None if it failed.
+
+        A forward pass that throws retires the model exactly as a failed load
+        does -- net cleared, error recorded, caller falls back to
+        reference-diff -- rather than propagating. A classifier is not worth a
+        crashed monitor. The file's mtime is left alone, so scp-ing a fixed
+        model over it is what brings it back.
+        """
+        if self.net is None:
+            return None
+        try:
+            self.net.setInput(model_blob(raw, cfg.get("roi"), self.input_size))
+            out = self.net.forward()
+            return float(np.asarray(out).reshape(-1)[0])
+        except (cv2.error, ValueError, IndexError) as exc:
+            self.net = None
+            self.error = f"forward failed: {cv2_error_detail(exc)}"
+            return None
+
+
 def _latest_frame_for_reference(cfg, max_age_s=90):
     """The newest frame `watch` already wrote, or None.
 
@@ -2763,9 +3215,15 @@ def cmd_presence(cfg, args):
 ARCHIVE_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})_([0-9.]+)\.jpg$")
 
 
-def archive_index(cfg):
-    """Every archived frame as (when, score, filename), sorted by time."""
-    d = os.path.join(HERE, cfg["archive_dir"])
+def archive_index(cfg, archive_dir=None):
+    """Every archived frame as (when, score, filename), sorted by time.
+
+    `archive_dir` overrides the configured one, so a pile of frames rsynced
+    off the Pi into .local/ can be indexed on the Mac without editing config
+    (and without the Mac's own archive, shot at a different camera angle,
+    getting mixed into the same manifest).
+    """
+    d = os.path.join(HERE, archive_dir or cfg["archive_dir"])
     if not os.path.isdir(d):
         return []
     out = []
@@ -2790,13 +3248,32 @@ def cmd_dataset(cfg, args):
 
     The recommended label is dog present/absent, which is unambiguous from a
     single frame and fixes the one thing motion detection structurally cannot
-    do: tell a sleeping dog from an empty pen.
+    do: tell a sleeping dog from an empty pen. `label_dog_present` is filled in
+    automatically from the windows recorded by `label-presence`; a frame
+    outside every window is left blank, never guessed.
     """
-    frames = archive_index(cfg)
+    archive_dir = args.archive or cfg["archive_dir"]
+    frames = archive_index(cfg, archive_dir)
     if not frames:
         raise SystemExit(
-            f"No archived frames in {cfg['archive_dir']}/.\n"
+            f"No archived frames in {archive_dir}/.\n"
             'Set "archive_all_samples": true in config.json and run `watch`.')
+
+    # Ground truth, if any has been recorded. Applied to the frame list before
+    # anything else so that --labeled-only spends the whole --limit budget on
+    # frames that can actually be trained on, and so the block splits below
+    # cover the labeled span rather than an archive that is mostly unlabeled.
+    labels_path = args.labels or PRESENCE_LABELS_PATH
+    labels = read_presence_labels(labels_path)
+    unlabeled = sum(1 for f in frames if presence_label_at(f[0], labels) is None)
+    if args.labeled_only:
+        frames = [f for f in frames if presence_label_at(f[0], labels) is not None]
+        if not frames:
+            raise SystemExit(
+                f"None of the archived frames in {archive_dir}/ fall inside a "
+                f"presence label window.\n"
+                "Record some with `label-presence --from ... --to ... --label "
+                "dog|empty`.")
 
     # Weak state per timestamp, from the log.
     rows = read_log(cfg)
@@ -2853,17 +3330,20 @@ def cmd_dataset(cfg, args):
         for when, score, name in picked:
             weak = by_time.get(when.replace(microsecond=0), (None, "unknown"))[1]
             b = block_of(when)
-            wr.writerow([os.path.join(cfg["archive_dir"], name), when.isoformat(),
+            label = presence_label_at(when, labels)
+            wr.writerow([os.path.join(archive_dir, name), when.isoformat(),
                          f"{score:.6f}", weak,
                          "1" if (when.hour >= 20 or when.hour < 6) else "0",
-                         b, split_of[b], "", ""])
+                         b, split_of[b],
+                         "" if label is None else ("1" if label == "dog" else "0"),
+                         ""])
 
     counts = {}
     for when, _s, _n in picked:
         counts[split_of[block_of(when)]] = counts.get(split_of[block_of(when)], 0) + 1
 
     print(f"  archive spans {t0:%Y-%m-%d %H:%M} to {t1:%H:%M}, "
-          f"{len(frames)} frames")
+          f"{len(frames)} frames  ({archive_dir}/)")
     print(f"  sampled {len(picked)} across {len(strata)} strata "
           f"(weak_state x day/night)")
     print(f"  {nblocks} time blocks of {args.block_minutes} min; splits assigned "
@@ -2882,9 +3362,24 @@ def cmd_dataset(cfg, args):
     for key, items in sorted(strata.items(), key=lambda kv: str(kv[0])):
         weak, dark = key
         print(f"    {weak:<9}{'night' if dark else 'day':<7}{len(items):>6} available")
+    by_label = {"dog": 0, "empty": 0, None: 0}
+    for when, _s, _n in picked:
+        by_label[presence_label_at(when, labels)] += 1
+    print(f"\n  labels from {os.path.basename(labels_path)} "
+          f"({len(labels)} window(s)):")
+    print(f"    dog        {by_label['dog']:>6} exported")
+    print(f"    empty      {by_label['empty']:>6} exported")
+    print(f"    unlabeled  {by_label[None]:>6} exported"
+          + (" (excluded by --labeled-only)" if args.labeled_only else ""))
+    if args.labeled_only:
+        print(f"    {unlabeled} unlabeled frame(s) were dropped from the archive "
+              f"before sampling")
+
     print(f"\n  Wrote {manifest}")
-    print("  Fill in label_dog_present with 1 or 0. The images stay where they "
-          "are;\n  the manifest only references them.")
+    if by_label[None]:
+        print("  Fill in the blank label_dog_present cells with 1 or 0, or "
+              "record the\n  windows with `label-presence` and re-export. The "
+              "images stay where\n  they are; the manifest only references them.")
     print("\n  NOTE: weak_state is the monitor's own decision, derived from the\n"
           "  thresholds a model would be used to check. Do not train on it.")
 
@@ -3013,14 +3508,60 @@ def cmd_watch(cfg, args):
     # measured overnight, that cost 12 minutes of invented sleep on 2026-08-13.
     references = load_references(cfg)
     references_mtime = ref_dir_mtime()
+
+    # The learned classifier, if one is deployed. It supersedes the reference
+    # diff as the source of presence verdicts, but does not replace the
+    # reference machinery: the diff is still computed every sample for the
+    # journal, for presence_model.csv (which is how the two get compared), and
+    # for the auto-refresh gate, which keeps the references fresh so the
+    # fallback stays usable if the model is ever pulled.
+    model = PresenceModel(cfg)
+    model_error_shown = model.error
+    # Shadow: the model runs and is recorded but the references keep driving.
+    # last_vote carries the model's last decisive vote across abstains; see
+    # carry_vote for why an abstain must never reach the machine as None once
+    # a real vote exists.
+    shadow = bool(cfg.get("presence_model_shadow"))
+    last_vote = None
+    if model.active:
+        src = model.sidecar.get("trained_at") or "unknown date"
+        print(f"Presence: MODEL{' (SHADOW)' if shadow else ''} {model.rel} "
+              f"({model.input_size[0]}x{model.input_size[1]}, trained {src}), "
+              f"occupied at p >= {model.threshold + model.deadband:.2f}, "
+              f"empty at p <= {model.threshold - model.deadband:.2f}, "
+              f"abstain between."
+              + ("  Shadow mode: predicted and logged every sample, but the "
+                 "references drive the machine." if shadow else ""))
+    elif model.path:
+        print(f"Presence: MODEL UNAVAILABLE: {model.error}\n"
+              f"  Falling back to reference-diff presence.")
     if references:
-        print(f"Presence: {len(references)} empty-pen reference(s) "
+        print(f"{'  also: ' if model.active else 'Presence: '}"
+              f"{len(references)} empty-pen reference(s) "
               f"({', '.join(n for n, _ in references)}), threshold "
               f"{cfg['presence_threshold']}, trusted while ref-corr >= "
-              f"{cfg['presence_ref_corr_min']}.")
-    else:
-        print("Presence: NO references, so an empty pen will read as asleep.\n"
+              f"{cfg['presence_ref_corr_min']}."
+              + ("  (logged, not acted on)" if model.active else ""))
+    elif not model.active:
+        print("Presence: NO references and no model, so an empty pen will read "
+              "as asleep.\n"
               "  Run `reference` while the pen is empty to fix that.")
+
+    # One row per sample of what the classifier said, next to what the
+    # reference diff said about the same frame. Opened whenever a model is
+    # *configured*, not only when it loaded, so a model scp-ed into place
+    # mid-run has somewhere to write from its first sample.
+    model_log = model_writer = None
+    if model.path and (cfg.get("presence_model_log") or ""):
+        p = os.path.join(HERE, cfg["presence_model_log"])
+        model_log_is_new = not os.path.exists(p)
+        model_log = open(p, "a", newline="")
+        model_writer = csv.writer(model_log)
+        if model_log_is_new:
+            model_writer.writerow(["timestamp", "p", "vote", "ref_presence",
+                                   "ref_corr", "ir"])
+            model_log.flush()
+        print(f"  model calibration log -> {os.path.relpath(p, HERE)}")
 
     # Auto-refresh bookkeeping; see the DEFAULTS comment for the reasoning and
     # the full list of gates.
@@ -3101,6 +3642,19 @@ def cmd_watch(cfg, args):
                 print(f"{stamp()}  references reloaded: "
                       f"{', '.join(n for n, _ in references) or 'none'}")
 
+            # Same trick for the model: poll its mtime so a freshly scp-ed
+            # ONNX takes effect on the next sample, and say one line when its
+            # health changes rather than one per sample forever.
+            if model.reload_if_changed():
+                print(f"{stamp()}  presence model reloaded: {model.rel} "
+                      f"({model.input_size[0]}x{model.input_size[1]})")
+            if model.error != model_error_shown:
+                model_error_shown = model.error
+                if model.error:
+                    print(f"{stamp()}  PRESENCE MODEL UNAVAILABLE: "
+                          f"{model.error}. Falling back to reference-diff "
+                          f"presence.")
+
             score = motion_score(prev, cur, cfg["pixel_threshold"])
             corr = correlation(prev, cur)
             pres, _ref, ref_corr = presence_score(
@@ -3112,33 +3666,74 @@ def cmd_watch(cfg, args):
             # camera flips its own IR lamp on its own schedule, and a clock
             # rule would disagree with it on overcast afternoons and in the
             # minutes either side of dusk.
-            pres_thr = (cfg["presence_threshold_night"] if frame_is_ir(raw)
+            ir = frame_is_ir(raw)
+            pres_thr = (cfg["presence_threshold_night"] if ir
                         else cfg["presence_threshold"])
 
-            was_reliable = machine.presence_reliable
-            state, tag, changed = machine.update(score, corr, pres, pres_thr,
-                                                 ref_corr)
+            # Captured before predict(), which retires the model on a failed
+            # forward pass. Whether this sample is model-driven has to be one
+            # decision made once: letting a single bad frame swap the source
+            # mid-loop would fire spurious reference-stale events on the way
+            # past.
+            model_active = model.active
+            model_drives = model_active and not shadow
+            p_dog, vote = None, None
+            if model_active:
+                p_dog = model.predict(raw, cfg)
+                if p_dog is not None:
+                    vote = model_vote(p_dog, model.threshold, model.deadband)
+                if model_writer is not None:
+                    model_writer.writerow([
+                        stamp(),
+                        "" if p_dog is None else f"{p_dog:.6f}",
+                        "abstain" if vote is None else vote,
+                        "" if pres is None else f"{pres:.6f}",
+                        "" if ref_corr is None else f"{ref_corr:.4f}",
+                        "1" if ir else "0"])
+                    model_log.flush()
 
-            # A reference going stale is an event, not a mood. It gets one
-            # loud line and one row in events.csv the moment it happens,
-            # because from here until someone re-baselines, `away` cannot fire
-            # and stillness reports "unknown" -- a dashboard needs to say why.
-            if machine.presence_reliable != was_reliable:
-                if not machine.presence_reliable:
-                    shot = record("reference-stale", pres or 0.0, raw)
-                    print(f"{stamp()}  REFERENCE STALE: frame correlates "
-                          f"{ref_corr:+.2f} with the closest empty-pen "
-                          f"reference (trust floor "
-                          f"{cfg['presence_ref_corr_min']}). The scene has "
-                          f"changed -- crate moved, camera nudged, or a "
-                          f"lighting condition with no reference. Presence is "
-                          f"unreliable until `reference` is re-run on an "
-                          f"empty pen."
-                          + (f"  [{shot}]" if shot else ""))
-                else:
-                    record("reference-ok", pres or 0.0, raw)
-                    print(f"{stamp()}  reference trusted again "
-                          f"(corr {ref_corr:+.2f})")
+            if model_drives:
+                # ref_corr is deliberately NOT passed. Reference trust is a
+                # statement about whether the stored empty-pen frames still
+                # describe the room, and the model does not consult them --
+                # a rearranged pen that discredits every reference has no
+                # bearing on whether the classifier can see a dog. Feeding it
+                # here would disable a working presence layer over a stale
+                # file it never reads. So the machine stays trusted, and the
+                # abstain band carries the "I do not know" that reference
+                # trust used to carry.
+                acted, last_vote = carry_vote(vote, last_vote)
+                mach_pres, mach_thr = vote_to_presence(acted)
+                state, tag, changed = machine.update(score, corr, mach_pres,
+                                                     mach_thr, None)
+            else:
+                was_reliable = machine.presence_reliable
+                state, tag, changed = machine.update(score, corr, pres,
+                                                     pres_thr, ref_corr)
+
+                # A reference going stale is an event, not a mood. It gets one
+                # loud line and one row in events.csv the moment it happens,
+                # because from here until someone re-baselines, `away` cannot
+                # fire and stillness reports "unknown" -- a dashboard needs to
+                # say why. Only meaningful in reference mode: with a model
+                # driving, ref_corr never reaches the machine, so trust never
+                # moves and this could not fire anyway.
+                if machine.presence_reliable != was_reliable:
+                    if not machine.presence_reliable:
+                        shot = record("reference-stale", pres or 0.0, raw)
+                        print(f"{stamp()}  REFERENCE STALE: frame correlates "
+                              f"{ref_corr:+.2f} with the closest empty-pen "
+                              f"reference (trust floor "
+                              f"{cfg['presence_ref_corr_min']}). The scene has "
+                              f"changed -- crate moved, camera nudged, or a "
+                              f"lighting condition with no reference. Presence "
+                              f"is unreliable until `reference` is re-run on "
+                              f"an empty pen."
+                              + (f"  [{shot}]" if shot else ""))
+                    else:
+                        record("reference-ok", pres or 0.0, raw)
+                        print(f"{stamp()}  reference trusted again "
+                              f"(corr {ref_corr:+.2f})")
 
             # Auto-refresh: after a long, provably empty, completely still
             # stretch, re-baseline the current lighting's reference so slow
@@ -3158,7 +3753,7 @@ def cmd_watch(cfg, args):
             if (empty_still_run >= refresh_needed
                     and pres >= cfg["reference_refresh_min_drift"]
                     and time.monotonic() >= refresh_cooldown_until):
-                label = "night" if frame_is_ir(raw) else "day"
+                label = "night" if ir else "day"
                 os.makedirs(REF_DIR, exist_ok=True)
                 path = os.path.join(
                     REF_DIR, f"{label}_{datetime.now():%Y%m%dT%H%M%S}.jpg")
@@ -3182,6 +3777,21 @@ def cmd_watch(cfg, args):
                           "ref_corr": None if ref_corr is None
                           else round(ref_corr, 3),
                           "references": len(references),
+                          # Which layer the verdict above came from, and the
+                          # classifier's raw number behind it. Without
+                          # `source` a client cannot tell an "occupied" the
+                          # model is sure of from one a stale reference
+                          # invented, and those need different sentences for
+                          # exactly the reason `reliable` needed to exist.
+                          "source": presence_source(model_drives,
+                                                    bool(references)),
+                          "p_dog": None if p_dog is None else round(p_dog, 4),
+                          "model_error": model.error,
+                          # A model that is running but not driving. `source`
+                          # says "reference" and this says why p_dog is there
+                          # anyway, so a client can show the rehearsal as a
+                          # rehearsal.
+                          "shadow": bool(model_active and shadow),
                       })
 
             if time.monotonic() >= next_snap:
@@ -3210,15 +3820,25 @@ def cmd_watch(cfg, args):
                 # scores but nothing that said whether they meant anything.
                 pres_txt = (f"  pres {pres:.3f} rc {ref_corr:+.2f}"
                             if pres is not None else "")
+                # The classifier's number sits next to the reference diff's,
+                # not instead of it. Reading the two side by side for a night
+                # is how you find out whether the model is actually better
+                # here or only different, and it is the same journal a human
+                # already watches.
+                model_txt = ("" if not model_active else
+                             f"  p {'--' if p_dog is None else f'{p_dog:.2f}'} "
+                             f"vote {VOTE_WORDS.get(vote, 'abstain')}")
                 print(f"{stamp()}  score {score:.4f}  {tag:<6} "
                       f"quiet {machine.quiet_run}/{quiet_needed}  "
-                      f"state {state}{pres_txt}")
+                      f"state {state}{model_txt}{pres_txt}")
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
         cam.close()
         log.close()
         events.close()
+        if model_log is not None:
+            model_log.close()
 
 
 def main():
@@ -3245,6 +3865,15 @@ def main():
     p.add_argument("--from", dest="start", required=True, help="HH:MM, HH:MM:SS or ISO")
     p.add_argument("--to", dest="end", required=True, help="HH:MM, HH:MM:SS or ISO")
     p.add_argument("--label", choices=["quiet", "active"], required=True)
+
+    p = sub.add_parser("label-presence",
+                       help="record that a window was dog-occupied or empty")
+    p.add_argument("--from", dest="start", required=True,
+                   help="HH:MM, HH:MM:SS or ISO")
+    p.add_argument("--to", dest="end", required=True,
+                   help="HH:MM, HH:MM:SS or ISO")
+    p.add_argument("--label", choices=["dog", "empty"], required=True)
+    p.add_argument("--notes", help="free text; how you know, what was in frame")
 
     p = sub.add_parser("mark", help="mark the pen empty/occupied by hand")
     p.add_argument("kind", choices=["out", "in"])
@@ -3280,6 +3909,15 @@ def main():
     p.add_argument("--block-minutes", type=int, default=20,
                    help="split granularity; must exceed any autocorrelation")
     p.add_argument("--out", default="dataset", help="output directory")
+    p.add_argument("--archive", help="read frames from this directory instead "
+                                     "of the configured archive_dir, e.g. a "
+                                     "copy rsynced off the Pi into .local/")
+    p.add_argument("--labeled-only", action="store_true",
+                   help="export only frames inside a `label-presence` window")
+    p.add_argument("--labels", help="read label windows from this file instead "
+                                    "of presence_labels.csv; for throwaway "
+                                    "label sets that should not touch the real "
+                                    "one")
 
     p = sub.add_parser("serve", help="read-only JSON API for the iOS app")
     p.add_argument("--bind", help="interface to bind (default 127.0.0.1)")
@@ -3307,6 +3945,7 @@ def main():
      "calibrate": cmd_calibrate,
      "watch": cmd_watch,
      "label": cmd_label,
+     "label-presence": cmd_label_presence,
      "tune": cmd_tune,
      "purge": cmd_purge,
      "dataset": cmd_dataset,
