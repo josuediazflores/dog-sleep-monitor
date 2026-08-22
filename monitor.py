@@ -3517,21 +3517,21 @@ def cmd_watch(cfg, args):
     # fallback stays usable if the model is ever pulled.
     model = PresenceModel(cfg)
     model_error_shown = model.error
-    # Shadow: the model runs and is recorded but the references keep driving.
+    # Model shadow mode: the model runs and is recorded but the references keep driving.
     # last_vote carries the model's last decisive vote across abstains; see
     # carry_vote for why an abstain must never reach the machine as None once
     # a real vote exists.
-    shadow = bool(cfg.get("presence_model_shadow"))
+    model_shadow = bool(cfg.get("presence_model_shadow"))
     last_vote = None
     if model.active:
         src = model.sidecar.get("trained_at") or "unknown date"
-        print(f"Presence: MODEL{' (SHADOW)' if shadow else ''} {model.rel} "
+        print(f"Presence: MODEL{' (SHADOW)' if model_shadow else ''} {model.rel} "
               f"({model.input_size[0]}x{model.input_size[1]}, trained {src}), "
               f"occupied at p >= {model.threshold + model.deadband:.2f}, "
               f"empty at p <= {model.threshold - model.deadband:.2f}, "
               f"abstain between."
               + ("  Shadow mode: predicted and logged every sample, but the "
-                 "references drive the machine." if shadow else ""))
+                 "references drive the machine." if model_shadow else ""))
     elif model.path:
         print(f"Presence: MODEL UNAVAILABLE: {model.error}\n"
               f"  Falling back to reference-diff presence.")
@@ -3676,7 +3676,7 @@ def cmd_watch(cfg, args):
             # mid-loop would fire spurious reference-stale events on the way
             # past.
             model_active = model.active
-            model_drives = model_active and not shadow
+            model_drives = model_active and not model_shadow
             p_dog, vote = None, None
             if model_active:
                 p_dog = model.predict(raw, cfg)
@@ -3791,7 +3791,7 @@ def cmd_watch(cfg, args):
                           # says "reference" and this says why p_dog is there
                           # anyway, so a client can show the rehearsal as a
                           # rehearsal.
-                          "shadow": bool(model_active and shadow),
+                          "shadow": bool(model_active and model_shadow),
                       })
 
             if time.monotonic() >= next_snap:
